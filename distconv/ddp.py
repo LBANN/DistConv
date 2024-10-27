@@ -1,5 +1,4 @@
 import torch
-import functools
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from distconv import ParallelStrategy

@@ -283,7 +283,8 @@ def distconv_backward(
     )
 
     # Determine the halo size for halo exchange
-    halo_size = weight.size(shard_dim) // 2
+    kernel_size = weight.size(shard_dim)
+    halo_size = kernel_size // 2 if (kernel_size % 2 == 1) else 0
 
     # Perform forward halo exchange to prepare the input tensor for convolution
     input_tensor_with_halo = forward_halo_exchange(

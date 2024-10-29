@@ -1,11 +1,16 @@
 import pytest
-from utils import fp32_allclose
+from utils import fp32_allclose, cleanup_parallel_strategy
 import torch
 import torch.nn as nn
-from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
-from torch.distributed.tensor import DTensor, Shard, Replicate, distribute_tensor
 from distconv import DCTensor, ParallelStrategy, DistConvDDP
+
+
+@pytest.fixture(scope="module")
+def parallel_strategy():
+    ps = ParallelStrategy(num_shards=4)
+    yield ps
+    cleanup_parallel_strategy(ps)
 
 
 def generate_configs():
@@ -20,21 +25,25 @@ def generate_configs():
 
 
 @pytest.mark.parametrize(*generate_configs())
-def test_strides(ndims: int, kernel_size: int, padding: int, stride: int):
+def test_strides(
+    parallel_strategy: ParallelStrategy,
+    ndims: int,
+    kernel_size: int,
+    padding: int,
+    stride: int,
+):
     """
     Test distributed convolution with different number of dimensions, kernel sizes, and strides.
     Checks the output and gradients of the distributed convolution against the non-distributed
     convolution.
 
     Args:
+        parallel_strategy (ParallelStrategy): Parallel strategy for the distributed convolution.
         ndims (int): Number of dimensions for the convolution (1, 2, or 3).
         kernel_size (int): Size of the convolution kernel.
         padding (int): Amount of padding to apply to the input tensor.
         stride (int): Stride of the convolution.
     """
-    # Define the parallel strategy for distributed convolution
-    ps = ParallelStrategy(num_shards=4)
-
     # Initialize the input tensor and convolution layer
     shape = [1, 4] + [64] * ndims
     x = torch.randn(*shape, device="cuda", requires_grad=True)
@@ -52,8 +61,8 @@ def test_strides(ndims: int, kernel_size: int, padding: int, stride: int):
 
     # Perform forward and backward pass for distributed convolution
     conv.zero_grad()
-    ddp_conv = DistConvDDP(conv, parallel_strategy=ps)
-    dcx = DCTensor.distribute(x, ps)
+    ddp_conv = DistConvDDP(conv, parallel_strategy=parallel_strategy)
+    dcx = DCTensor.distribute(x, parallel_strategy)
     dcy = ddp_conv(dcx)
     ddpy = dcy.to_ddp()
     ddpy.square().mean().backward()

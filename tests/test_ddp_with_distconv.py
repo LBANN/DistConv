@@ -1,11 +1,18 @@
 import pytest
-from utils import fp32_allclose
+from utils import fp32_allclose, cleanup_parallel_strategy
 import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Shard, Replicate, distribute_tensor
 from distconv import DCTensor, ParallelStrategy, DistConvDDP
+
+
+@pytest.fixture(scope="module")
+def parallel_strategy():
+    ps = ParallelStrategy(num_shards=2)
+    yield ps
+    cleanup_parallel_strategy(ps)
 
 
 def generate_configs():
@@ -19,25 +26,28 @@ def generate_configs():
 
 
 @pytest.mark.parametrize(*generate_configs())
-def test_ddp_with_distconv(ndims: int, shard_dim: int, kernel_size: int):
+def test_ddp_with_distconv(
+    parallel_strategy: ParallelStrategy, ndims: int, shard_dim: int, kernel_size: int
+):
     """
     Test DDP with distributed convolution using different number of dimensions and shard dimensions.
     Checks the output and gradients of the DDP with distributed convolution against the DDP-only
     convolution.
 
     Args:
+        parallel_strategy (ParallelStrategy): Parallel strategy for the distributed convolution.
         ndims (int): Number of dimensions for the convolution (1, 2, or 3).
         shard_dim (int): Dimension along which the tensor is sharded.
         kernel_size (int): Size of the convolution kernel.
     """
-    # Define the parallel strategy for distributed convolution
-    ps = ParallelStrategy(num_shards=2, shard_dim=2 + shard_dim)
+    # Set the shard dimension for the parallel strategy
+    parallel_strategy.shard_dim = 2 + shard_dim
 
     # Initialize the input tensor (and distribute it) and convolution layer
     shape = [2, 4] + [64] * ndims
     x = torch.randn(*shape, device="cuda")
     x = (
-        distribute_tensor(x, ps.device_mesh, [Shard(0), Replicate()])
+        distribute_tensor(x, parallel_strategy.device_mesh, [Shard(0), Replicate()])
         .to_local()
         .requires_grad_()
     )
@@ -54,8 +64,8 @@ def test_ddp_with_distconv(ndims: int, shard_dim: int, kernel_size: int):
 
     # Perform forward and backward pass for distributed convolution
     conv.zero_grad()
-    dc_conv = DistConvDDP(conv, parallel_strategy=ps)
-    dcx = DCTensor.distribute(x, ps)
+    dc_conv = DistConvDDP(conv, parallel_strategy=parallel_strategy)
+    dcx = DCTensor.distribute(x, parallel_strategy)
     dcy = dc_conv(dcx)
     ddpy = dcy.to_ddp()
     ddpy.square().mean().backward()

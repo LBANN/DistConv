@@ -1,10 +1,11 @@
+from typing import Callable, Dict, List, Tuple
+
 import torch
-from torch.autograd import Function
 import torch.distributed as dist
+from torch.autograd import Function
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor, Shard, Replicate, distribute_tensor
+from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from torch.utils._pytree import tree_map
-from typing import List, Callable, Tuple, Dict
 
 
 class ParallelStrategy:

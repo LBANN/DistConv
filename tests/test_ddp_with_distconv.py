@@ -1,11 +1,12 @@
 import pytest
-from utils import fp32_allclose, cleanup_parallel_strategy
 import torch
-import torch.nn as nn
-from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
-from torch.distributed.tensor import DTensor, Shard, Replicate, distribute_tensor
-from distconv import DCTensor, ParallelStrategy, DistConvDDP
+import torch.nn as nn
+from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
+from torch.nn.parallel import DistributedDataParallel as DDP
+from utils import cleanup_parallel_strategy, fp32_allclose
+
+from distconv import DCTensor, DistConvDDP, ParallelStrategy
 
 
 @pytest.fixture(scope="module")

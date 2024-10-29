@@ -1,7 +1,8 @@
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
-from distconv import ParallelStrategy
+
+from .distconv import ParallelStrategy
 
 
 class DistConvDDP(DistributedDataParallel):

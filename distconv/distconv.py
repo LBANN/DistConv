@@ -223,17 +223,25 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
     shard_dim = parallel_strategy.shard_dim
 
     # Unwrap the underlying tensor from the DCTensor
-    tensor = tensor._tensor
+    torch_tensor = tensor._tensor
 
     # Check if the distributed convolution is supported with the given parameters
-    check_is_distconv_supported(shard_dim, tensor, weight, stride, padding, dilation)
+    check_is_distconv_supported(
+        shard_dim, torch_tensor, weight, stride, padding, dilation
+    )
 
     # Determine the halo size for halo exchange
     kernel_size = weight.size(shard_dim)
     halo_size = kernel_size // 2 if (kernel_size % 2 == 1) else 0
 
     # Perform forward halo exchange to prepare the tensor for convolution
-    tensor_with_halo = forward_halo_exchange(tensor, halo_size, parallel_strategy)
+    tensor_with_halo = forward_halo_exchange(torch_tensor, halo_size, parallel_strategy)
+
+    # Save the tensor with its halo for the backward pass.
+    tensor._tensor_with_halo = tensor_with_halo
+    tensor._tensor = tensor_with_halo.narrow(
+        shard_dim, halo_size, tensor.size(shard_dim)
+    )
 
     # Update the arguments with the tensor including halos and adjusted padding
     args[0] = tensor_with_halo
@@ -275,21 +283,24 @@ def distconv_backward(
 
     # Unwrap the underlying tensors from the DCTensors
     grad_out_tensor = grad_out_tensor._tensor
-    input_tensor = input_tensor._tensor
+    input_torch_tensor = input_tensor._tensor
 
     # Check if the distributed convolution is supported with the given parameters
     check_is_distconv_supported(
-        shard_dim, input_tensor, weight, stride, padding, dilation
+        shard_dim, input_torch_tensor, weight, stride, padding, dilation
     )
 
     # Determine the halo size for halo exchange
     kernel_size = weight.size(shard_dim)
     halo_size = kernel_size // 2 if (kernel_size % 2 == 1) else 0
 
-    # Perform forward halo exchange to prepare the input tensor for convolution
-    input_tensor_with_halo = forward_halo_exchange(
-        input_tensor, halo_size, parallel_strategy
-    )
+    # Get the input tensor including halos if available, otherwise perform forward halo exchange
+    if input_tensor._tensor_with_halo is not None:
+        input_tensor_with_halo = input_tensor._tensor_with_halo
+    else:
+        input_tensor_with_halo = forward_halo_exchange(
+            input_torch_tensor, halo_size, parallel_strategy
+        )
 
     # Update the arguments with the gradient output tensor, input tensor including halos, and adjusted padding
     args[0] = grad_out_tensor
@@ -318,6 +329,7 @@ class DCTensor(torch.Tensor):
     """
 
     _tensor: torch.Tensor
+    _tensor_with_halo: torch.Tensor = None
     _parallel_strategy: ParallelStrategy
 
     @staticmethod
@@ -427,6 +439,9 @@ class DCTensor(torch.Tensor):
 
         def unwrap(t):
             if isinstance(t, DCTensor):
+                assert (
+                    self._parallel_strategy == t._parallel_strategy
+                ), "Parallel strategy mismatch"
                 return t._tensor
             else:
                 return t

@@ -8,8 +8,8 @@ from distconv import DCTensor, DistConvDDP, ParallelStrategy
 
 
 @pytest.fixture(scope="module")
-def parallel_strategy():
-    ps = ParallelStrategy(num_shards=4)
+def parallel_strategy(device: torch.device):
+    ps = ParallelStrategy(num_shards=4, device_type=device.type)
     yield ps
     cleanup_parallel_strategy(ps)
 
@@ -32,6 +32,7 @@ def test_strides(
     kernel_size: int,
     padding: int,
     stride: int,
+    device: torch.device,
 ):
     """
     Test distributed convolution with different number of dimensions, kernel sizes, and strides.
@@ -44,14 +45,15 @@ def test_strides(
         kernel_size (int): Size of the convolution kernel.
         padding (int): Amount of padding to apply to the input tensor.
         stride (int): Stride of the convolution.
+        device (torch.device): Torch device to run test with.
     """
     # Initialize the input tensor and convolution layer
     shape = [1, 4] + [64] * ndims
-    x = torch.randn(*shape, device="cuda", requires_grad=True)
+    x = torch.randn(*shape, device=device, requires_grad=True)
     conv_class = getattr(nn, f"Conv{ndims}d")
-    conv = conv_class(
-        4, 8, kernel_size=kernel_size, padding=padding, stride=stride
-    ).cuda()
+    conv = conv_class(4, 8, kernel_size=kernel_size, padding=padding, stride=stride).to(
+        device
+    )
 
     # Perform forward and backward pass for reference (non-distributed) convolution
     conv.zero_grad()

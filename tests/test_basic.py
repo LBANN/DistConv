@@ -8,8 +8,8 @@ from distconv import DCTensor, DistConvDDP, ParallelStrategy
 
 
 @pytest.fixture(scope="module")
-def parallel_strategy():
-    ps = ParallelStrategy(num_shards=4)
+def parallel_strategy(device: torch.device):
+    ps = ParallelStrategy(num_shards=4, device_type=device.type)
     yield ps
     cleanup_parallel_strategy(ps)
 
@@ -26,7 +26,11 @@ def generate_configs():
 
 @pytest.mark.parametrize(*generate_configs())
 def test_basic(
-    parallel_strategy: ParallelStrategy, ndims: int, shard_dim: int, kernel_size: int
+    parallel_strategy: ParallelStrategy,
+    ndims: int,
+    shard_dim: int,
+    kernel_size: int,
+    device: torch.device,
 ):
     """
     Test distributed convolution with different number of dimensions and shard dimensions.
@@ -38,15 +42,18 @@ def test_basic(
         ndims (int): Number of dimensions for the convolution (1, 2, or 3).
         shard_dim (int): Dimension along which the tensor is sharded.
         kernel_size (int): Size of the convolution kernel.
+        device (torch.device): Torch device to run test with.
     """
     # Set the shard dimension for the parallel strategy
     parallel_strategy.shard_dim = 2 + shard_dim
 
     # Initialize the input tensor and convolution layer
     shape = [1, 4] + [64] * ndims
-    x = torch.randn(*shape, device="cuda", requires_grad=True)
+    x = torch.randn(*shape, device=device, requires_grad=True)
     conv_class = getattr(nn, f"Conv{ndims}d")
-    conv = conv_class(4, 8, kernel_size=kernel_size, padding=kernel_size // 2).cuda()
+    conv = conv_class(4, 8, kernel_size=kernel_size, padding=kernel_size // 2).to(
+        device
+    )
 
     # Perform forward and backward pass for reference (non-distributed) convolution
     conv.zero_grad()

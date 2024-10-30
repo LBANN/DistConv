@@ -15,13 +15,14 @@ class ParallelStrategy:
     the tensor is sharded, and the device mesh configuration.
     """
 
-    def __init__(self, num_shards: int, shard_dim: int = 2):
+    def __init__(self, num_shards: int, shard_dim: int = 2, device_type: str = "cuda"):
         """
         Initialize the ParallelStrategy.
 
         Args:
             num_shards (int): The number of shards to divide the tensor into.
             shard_dim (int, optional): The dimension along which the tensor is sharded. Defaults to 2.
+            device_type (str, optional): The device type to use with DeviceMesh. Defaults to "cuda".
         """
         self.num_shards = num_shards
         self.shard_dim = shard_dim
@@ -31,7 +32,7 @@ class ParallelStrategy:
         self.shard_ind = dist.get_rank() % num_shards
 
         self.device_mesh = init_device_mesh(
-            "cuda",
+            device_type,
             mesh_shape=(self.ddp_ranks, num_shards),
             mesh_dim_names=("ddp", "dc"),
         )

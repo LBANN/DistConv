@@ -313,13 +313,14 @@ def distconv_backward(
     # Perform the backward convolution operation
     grad_in_tensor, grad_weight, grad_bias = func(*args, **kwargs)
 
-    # Perform backward halo exchange to accumulate halo contributions into the gradient input tensor
-    grad_in_tensor = backward_halo_exchange(
-        grad_in_tensor, halo_size, parallel_strategy
-    )
+    if grad_in_tensor is not None:
+        # Perform backward halo exchange to accumulate halo contributions into the gradient input tensor
+        grad_in_tensor = backward_halo_exchange(
+            grad_in_tensor, halo_size, parallel_strategy
+        )
 
-    # Wrap the gradient input tensor in a DCTensor
-    grad_in_tensor = DCTensor(grad_in_tensor, parallel_strategy)
+        # Wrap the gradient input tensor in a DCTensor
+        grad_in_tensor = DCTensor(grad_in_tensor, parallel_strategy)
 
     # Return the gradients with respect to the input tensor, weight, and bias
     return grad_in_tensor, grad_weight, grad_bias

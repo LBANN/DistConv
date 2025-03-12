@@ -1,11 +1,31 @@
+"""
+TODO: Add docs to stuff I have added
+"""
+
 from typing import Callable, Dict, List, Tuple
+from copy import copy
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.autograd import Function
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
+from torch.nn.functional import pad
 from torch.utils._pytree import tree_map
+
+import matplotlib.pyplot as plt
+
+
+def _reverse_repeat_tuple(t, n):
+    r"""Reverse the order of `t` and repeat each element for `n` times.
+
+    This can be used to translate padding arg used by Conv and Pooling modules
+    to the ones used by `F.pad`.
+
+    Credit: https://github.com/pytorch/pytorch/blob/v2.6.0/torch/nn/modules/utils.py
+    """
+    return tuple(x for x in reversed(t) for _ in range(n))
 
 
 class ParallelStrategy:
@@ -15,7 +35,14 @@ class ParallelStrategy:
     the tensor is sharded, and the device mesh configuration.
     """
 
-    def __init__(self, num_shards: int, shard_dim: int = 2, device_type: str = "cuda"):
+    def __init__(
+        self,
+        num_shards: int,
+        shard_dim: int = 2,
+        device_type: str = "cuda",
+        is_periodic: bool = False,
+        space_ndim: int = None,
+    ):
         """
         Initialize the ParallelStrategy.
 
@@ -23,9 +50,21 @@ class ParallelStrategy:
             num_shards (int): The number of shards to divide the tensor into.
             shard_dim (int, optional): The dimension along which the tensor is sharded. Defaults to 2.
             device_type (str, optional): The device type to use with DeviceMesh. Defaults to "cuda".
+            is_periodic (bool, optional): When true, adds checks to do circular padding on all boundaries.
+            space_ndim (int, optional): When periodic, need to define spatial dimension to assign 
+                which boundaries are recieved by P2POp and which boundaries are on same rank.
         """
         self.num_shards = num_shards
         self.shard_dim = shard_dim
+        self.space_ndim = space_ndim
+        self.is_periodic = is_periodic
+        if self.is_periodic:
+            self.nonshard_dim = []
+            for i in range(self.space_ndim):
+                if i == (self.shard_dim - 2):
+                    pass
+                else:
+                    self.nonshard_dim.append(i + 2)
 
         world_size = dist.get_world_size()
         self.ddp_ranks = world_size // num_shards
@@ -106,6 +145,7 @@ def forward_halo_exchange(
     shard_dim = parallel_strategy.shard_dim
     num_shards = parallel_strategy.num_shards
     shard_ind = parallel_strategy.shard_ind
+    is_periodic = parallel_strategy.is_periodic
     rank = dist.get_rank()
 
     # Prepare halos for sending and receiving
@@ -133,6 +173,25 @@ def forward_halo_exchange(
     reqs = dist.batch_isend_irecv(ops)
     for req in reqs:
         req.wait()
+
+    if is_periodic:
+        ops = []
+        if shard_ind == 0:
+            # Receive halo from the previous rank and send their halo back
+            ops += [
+                dist.P2POp(dist.irecv, halo_minus, (num_shards - 1)),
+                dist.P2POp(dist.isend, inner_halo_minus.contiguous(), (num_shards - 1)),
+            ]
+        if shard_ind == (num_shards - 1):
+            # Receive halo from the previous rank and send their halo back
+            ops += [
+                dist.P2POp(dist.irecv, halo_plus, 0),
+                dist.P2POp(dist.isend, inner_halo_plus.contiguous(), 0),
+            ]
+
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
 
     # Concatenate received halos with the original tensor
     tensor_with_halo = torch.cat([halo_minus, tensor, halo_plus], dim=shard_dim)
@@ -162,6 +221,8 @@ def backward_halo_exchange(
     shard_dim = parallel_strategy.shard_dim
     num_shards = parallel_strategy.num_shards
     shard_ind = parallel_strategy.shard_ind
+    is_periodic = parallel_strategy.is_periodic
+    nonshard_dim = parallel_strategy.nonshard_dim
     rank = dist.get_rank()
 
     # Prepare halos for sending and receiving
@@ -190,6 +251,25 @@ def backward_halo_exchange(
     for req in reqs:
         req.wait()
 
+    if is_periodic:
+        ops = []
+        if shard_ind == 0:
+            # Receive halo from the previous rank and send their halo back
+            ops += [
+                dist.P2POp(dist.irecv, recv_halo_minus, (num_shards - 1)),
+                dist.P2POp(dist.isend, send_halo_minus.contiguous(), (num_shards - 1)),
+            ]
+        if shard_ind == (num_shards - 1):
+            # Receive halo from the previous rank and send their halo back
+            ops += [
+                dist.P2POp(dist.irecv, recv_halo_plus, 0),
+                dist.P2POp(dist.isend, send_halo_plus.contiguous(), 0),
+            ]
+
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+
     # Accumulate received halos into the inner tensor
     inner_tensor = tensor.narrow(
         shard_dim, halo_size, tensor.size(shard_dim) - 2 * halo_size
@@ -199,7 +279,31 @@ def backward_halo_exchange(
     inner_halo_minus.add_(recv_halo_minus)
     inner_halo_plus.add_(recv_halo_plus)
 
-    return inner_tensor
+    if is_periodic:
+        inner_tensor_no_periodic = inner_tensor.clone()
+        for i in nonshard_dim:
+            assert (
+                shard_dim != i
+            ), f"{parallel_strategy.shard_dim} == {parallel_strategy.nonshard_dim}"
+            inner_tensor_no_periodic = inner_tensor_no_periodic.narrow(
+                i, halo_size, tensor.size(i) - 2 * halo_size
+            )
+
+            inner_halo_minus_p = inner_tensor_no_periodic.narrow(i, 0, halo_size)
+            inner_halo_plus_p = inner_tensor_no_periodic.narrow(
+                i, -halo_size, halo_size
+            )
+
+            copy_inner_halo_minus_p = inner_tensor.narrow(i, 0, halo_size).clone()
+            copy_inner_halo_plus_p = inner_tensor.narrow(
+                i, -halo_size, halo_size
+            ).clone()
+            inner_halo_minus_p.add_(copy_inner_halo_plus_p)
+            inner_halo_plus_p.add_(copy_inner_halo_minus_p)
+
+        return inner_tensor_no_periodic
+    else:
+        return inner_tensor
 
 
 def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
@@ -223,6 +327,7 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
     # Extract the parallel strategy and shard dimension from the input tensor
     parallel_strategy = tensor._parallel_strategy
     shard_dim = parallel_strategy.shard_dim
+    is_periodic = parallel_strategy.is_periodic
 
     # Unwrap the underlying tensor from the DCTensor
     torch_tensor = tensor._tensor
@@ -246,8 +351,13 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
     )
 
     # Update the arguments with the tensor including halos and adjusted padding
-    args[0] = tensor_with_halo
     padding[shard_dim - 2] = 0
+    if is_periodic:
+        tensor_with_halo = pad(
+            tensor_with_halo, _reverse_repeat_tuple(padding, 2), mode="circular"
+        )
+        padding = [0] * len(padding)
+    args[0] = tensor_with_halo
     args[4] = padding
 
     # Perform the convolution operation
@@ -282,6 +392,7 @@ def distconv_backward(
     # Extract the parallel strategy and shard dimension from the gradient output tensor
     parallel_strategy = grad_out_tensor._parallel_strategy
     shard_dim = parallel_strategy.shard_dim
+    is_periodic = parallel_strategy.is_periodic
 
     # Unwrap the underlying tensors from the DCTensors
     grad_out_tensor = grad_out_tensor._tensor
@@ -305,9 +416,15 @@ def distconv_backward(
         )
 
     # Update the arguments with the gradient output tensor, input tensor including halos, and adjusted padding
+    padding[shard_dim - 2] = 0
+    if is_periodic:
+        input_tensor_with_halo = pad(
+            input_tensor_with_halo, _reverse_repeat_tuple(padding, 2), mode="circular"
+        )
+        padding = [0] * len(padding)
+
     args[0] = grad_out_tensor
     args[1] = input_tensor_with_halo
-    padding[shard_dim - 2] = 0
     args[5] = padding
 
     # Perform the backward convolution operation
@@ -415,6 +532,22 @@ class DCTensor(torch.Tensor):
             device_mesh=device_mesh,
             placements=[Shard(shard_dim)],
         ).redistribute(device_mesh=device_mesh, placements=[Shard(0)])
+        return dtensor.to_local()
+
+    def to_replicate(self) -> torch.Tensor:
+        """
+        Convert the DCTensor to a simple replicated tensor.
+
+        Returns:
+            torch.Tensor: The full tensor.
+        """
+        device_mesh = self._parallel_strategy.device_mesh["dc"]
+        shard_dim = self._parallel_strategy.shard_dim
+        dtensor = DTensor.from_local(
+            _ToTensor.apply(self),
+            device_mesh=device_mesh,
+            placements=[Shard(shard_dim)],
+        ).redistribute(device_mesh=device_mesh, placements=[Replicate()])
         return dtensor.to_local()
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):

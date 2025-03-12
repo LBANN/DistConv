@@ -1,7 +1,3 @@
-"""
-TODO: Add docs to stuff I have added
-"""
-
 from typing import Callable, Dict, List, Tuple
 from copy import copy
 
@@ -58,8 +54,8 @@ class ParallelStrategy:
         self.shard_dim = shard_dim
         self.space_ndim = space_ndim
         self.is_periodic = is_periodic
+        self.nonshard_dim = []
         if self.is_periodic:
-            self.nonshard_dim = []
             for i in range(self.space_ndim):
                 if i == (self.shard_dim - 2):
                     pass

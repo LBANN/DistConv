@@ -185,9 +185,11 @@ def forward_halo_exchange(
                 dist.P2POp(dist.isend, inner_halo_plus.contiguous(), 0),
             ]
 
-        reqs = dist.batch_isend_irecv(ops)
-        for req in reqs:
-            req.wait()
+        # check if P2POps on this rank exist (only true for outer boundary ranks)
+        if len(ops) > 0:
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
 
     # Concatenate received halos with the original tensor
     tensor_with_halo = torch.cat([halo_minus, tensor, halo_plus], dim=shard_dim)
@@ -262,9 +264,11 @@ def backward_halo_exchange(
                 dist.P2POp(dist.isend, send_halo_plus.contiguous(), 0),
             ]
 
-        reqs = dist.batch_isend_irecv(ops)
-        for req in reqs:
-            req.wait()
+        # check if P2POps on this rank exist (only true for outer boundary ranks)
+        if len(ops) > 0:
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
 
     # Accumulate received halos into the inner tensor
     inner_tensor = tensor.narrow(

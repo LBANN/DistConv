@@ -41,7 +41,7 @@ def test_periodic(
     """
     # Set the shard dimension for the parallel strategy
     parallel_strategy = ParallelStrategy(
-        num_shards=2,
+        num_shards=4,
         shard_dim=shard_dim + 2,
         device_type=device.type,
         is_periodic=True,

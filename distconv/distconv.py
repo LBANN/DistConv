@@ -1,5 +1,4 @@
 from typing import Callable, Dict, List, Tuple
-from copy import copy
 
 import torch
 import torch.distributed as dist
@@ -9,8 +8,6 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from torch.nn.functional import pad
 from torch.utils._pytree import tree_map
-
-import matplotlib.pyplot as plt
 
 
 def _reverse_repeat_tuple(t, n):
@@ -47,7 +44,7 @@ class ParallelStrategy:
             shard_dim (int, optional): The dimension along which the tensor is sharded. Defaults to 2.
             device_type (str, optional): The device type to use with DeviceMesh. Defaults to "cuda".
             is_periodic (bool, optional): When true, adds checks to do circular padding on all boundaries.
-            space_ndim (int, optional): When periodic, need to define spatial dimension to assign 
+            space_ndim (int, optional): When periodic, need to define spatial dimension to assign
                 which boundaries are recieved by P2POp and which boundaries are on same rank.
         """
         self.num_shards = num_shards

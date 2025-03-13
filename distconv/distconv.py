@@ -1,4 +1,6 @@
+from copy import copy
 from typing import Callable, Dict, List, Tuple
+from numpy import arange, meshgrid, prod
 
 import torch
 import torch.distributed as dist
@@ -15,26 +17,49 @@ class ParallelStrategy:
     the tensor is sharded, and the device mesh configuration.
     """
 
-    def __init__(self, num_shards: int, shard_dim: int = 2, device_type: str = "cuda"):
+    def __init__(
+        self, num_shards: tuple, shard_dim: tuple = (2,), device_type: str = "cuda"
+    ):
         """
         Initialize the ParallelStrategy.
 
         Args:
-            num_shards (int): The number of shards to divide the tensor into.
-            shard_dim (int, optional): The dimension along which the tensor is sharded. Defaults to 2.
+            num_shards (list): The number of shards to divide the tensor into.
+            shard_dim (list, optional): The dimensions along which the tensor is sharded. Defaults to 2.
             device_type (str, optional): The device type to use with DeviceMesh. Defaults to "cuda".
         """
+        if type(num_shards) == int:
+            num_shards = (num_shards,)
+            shard_dim = (shard_dim,)
+        total_num_shards = prod(num_shards)
         self.num_shards = num_shards
         self.shard_dim = shard_dim
 
         world_size = dist.get_world_size()
-        self.ddp_ranks = world_size // num_shards
-        self.shard_ind = dist.get_rank() % num_shards
+        self.ddp_ranks = world_size // total_num_shards
+        # make lookup table of GPU->shard_ind
+        self.shard_ind = [None] * len(num_shards)
+        mesh = meshgrid(
+            *[arange(0, num_shards_i) for num_shards_i in num_shards]
+        )[::-1]
+        for i, mesh_i in enumerate(mesh):
+            self.shard_ind[i] = mesh_i.ravel()[dist.get_rank()]
+
+        # make lookup table of shard_ind->GPU
+        self.shard_to_gpu_map = {}
+        for i in range(total_num_shards):
+            id_list = [str(m.ravel()[i]) for m in mesh]
+            mesh_str = "-".join(id_list)
+            self.shard_to_gpu_map[mesh_str] = i
+
+        self.distconv_dim_names = tuple([f"dc{i}" for i in shard_dim])
+        mesh_shape = (self.ddp_ranks,) + num_shards
+        mesh_dim_names = ("ddp",) + self.distconv_dim_names
 
         self.device_mesh = init_device_mesh(
             device_type,
-            mesh_shape=(self.ddp_ranks, num_shards),
-            mesh_dim_names=("ddp", "dc"),
+            mesh_shape=mesh_shape,
+            mesh_dim_names=mesh_dim_names,
         )
 
 
@@ -85,7 +110,10 @@ def check_is_distconv_supported(
 
 
 def forward_halo_exchange(
-    tensor: torch.Tensor, halo_size: int, parallel_strategy: ParallelStrategy
+    tensor: torch.Tensor,
+    halo_size: int,
+    parallel_strategy: ParallelStrategy,
+    dim_index: int,
 ) -> torch.Tensor:
     """
     Perform forward halo exchange for distributed convolution.
@@ -103,9 +131,10 @@ def forward_halo_exchange(
         return tensor
 
     # Extract parallel strategy parameters
-    shard_dim = parallel_strategy.shard_dim
-    num_shards = parallel_strategy.num_shards
-    shard_ind = parallel_strategy.shard_ind
+    shard_dim = parallel_strategy.shard_dim[dim_index]
+    num_shards = parallel_strategy.num_shards[dim_index]
+    shard_ind = parallel_strategy.shard_ind[dim_index]
+    shard_to_gpu_map = parallel_strategy.shard_to_gpu_map
     rank = dist.get_rank()
 
     # Prepare halos for sending and receiving
@@ -117,16 +146,22 @@ def forward_halo_exchange(
     # Define communication operations
     ops = []
     if shard_ind > 0:
+        shard_minus = copy(parallel_strategy.shard_ind)
+        shard_minus[dim_index] -= 1
+        rank_minus = shard_to_gpu_map[shard_ind_to_str(shard_minus)]
         # Receive halo from the previous rank and send their halo back
         ops += [
-            dist.P2POp(dist.irecv, halo_minus, rank - 1),
-            dist.P2POp(dist.isend, inner_halo_minus.contiguous(), rank - 1),
+            dist.P2POp(dist.irecv, halo_minus, rank_minus),
+            dist.P2POp(dist.isend, inner_halo_minus.contiguous(), rank_minus),
         ]
     if shard_ind < (num_shards - 1):
+        shard_plus = copy(parallel_strategy.shard_ind)
+        shard_plus[dim_index] += 1
+        rank_plus = shard_to_gpu_map[shard_ind_to_str(shard_plus)]
         # Send halo to the next rank and receive their halo
         ops += [
-            dist.P2POp(dist.isend, inner_halo_plus.contiguous(), rank + 1),
-            dist.P2POp(dist.irecv, halo_plus, rank + 1),
+            dist.P2POp(dist.isend, inner_halo_plus.contiguous(), rank_plus),
+            dist.P2POp(dist.irecv, halo_plus, rank_plus),
         ]
 
     # Execute communication operations
@@ -141,7 +176,10 @@ def forward_halo_exchange(
 
 
 def backward_halo_exchange(
-    tensor: torch.Tensor, halo_size: int, parallel_strategy: ParallelStrategy
+    tensor: torch.Tensor,
+    halo_size: int,
+    parallel_strategy: ParallelStrategy,
+    dim_index: int,
 ) -> torch.Tensor:
     """
     Perform backward halo exchange for distributed convolution.
@@ -159,9 +197,10 @@ def backward_halo_exchange(
         return tensor
 
     # Extract parallel strategy parameters
-    shard_dim = parallel_strategy.shard_dim
-    num_shards = parallel_strategy.num_shards
-    shard_ind = parallel_strategy.shard_ind
+    shard_dim = parallel_strategy.shard_dim[dim_index]
+    num_shards = parallel_strategy.num_shards[dim_index]
+    shard_ind = parallel_strategy.shard_ind[dim_index]
+    shard_to_gpu_map = parallel_strategy.shard_to_gpu_map
     rank = dist.get_rank()
 
     # Prepare halos for sending and receiving
@@ -173,16 +212,24 @@ def backward_halo_exchange(
     # Define communication operations
     ops = []
     if shard_ind > 0:
+        # find neighbouring shard, and which gpu it belongs to
+        shard_minus = copy(parallel_strategy.shard_ind)
+        shard_minus[dim_index] -= 1
+        rank_minus = shard_to_gpu_map[shard_ind_to_str(shard_minus)]
         # Receive halo from previous rank and send their halo back
         ops += [
-            dist.P2POp(dist.irecv, recv_halo_minus, rank - 1),
-            dist.P2POp(dist.isend, send_halo_minus.contiguous(), rank - 1),
+            dist.P2POp(dist.irecv, recv_halo_minus, rank_minus),
+            dist.P2POp(dist.isend, send_halo_minus.contiguous(), rank_minus),
         ]
     if shard_ind < (num_shards - 1):
+        # find neighbouring shard, and which gpu it belongs to
+        shard_plus = copy(parallel_strategy.shard_ind)
+        shard_plus[dim_index] += 1
+        rank_plus = shard_to_gpu_map[shard_ind_to_str(shard_plus)]
         # Send halo to the next rank and receive their halo
         ops += [
-            dist.P2POp(dist.isend, send_halo_plus.contiguous(), rank + 1),
-            dist.P2POp(dist.irecv, recv_halo_plus, rank + 1),
+            dist.P2POp(dist.isend, send_halo_plus.contiguous(), rank_plus),
+            dist.P2POp(dist.irecv, recv_halo_plus, rank_plus),
         ]
 
     # Execute communication operations
@@ -223,38 +270,48 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
     # Extract the parallel strategy and shard dimension from the input tensor
     parallel_strategy = tensor._parallel_strategy
     shard_dim = parallel_strategy.shard_dim
+    num_shards = parallel_strategy.num_shards
+    shard_ind = parallel_strategy.shard_ind
 
     # Unwrap the underlying tensor from the DCTensor
     torch_tensor = tensor._tensor
 
     # Check if the distributed convolution is supported with the given parameters
-    check_is_distconv_supported(
-        shard_dim, torch_tensor, weight, stride, padding, dilation
-    )
+    tensor_with_halo = torch_tensor.clone()
+    for i, shard_dim_i in enumerate(shard_dim):
+        check_is_distconv_supported(
+            shard_dim_i, torch_tensor, weight, stride, padding, dilation
+        )
 
-    # Determine the halo size for halo exchange
-    kernel_size = weight.size(shard_dim)
-    halo_size = kernel_size // 2 if (kernel_size % 2 == 1) else 0
+        # Determine the halo size for halo exchange
+        kernel_size = weight.size(shard_dim_i)
+        halo_size = kernel_size // 2 if (kernel_size % 2 == 1) else 0
 
-    # Perform forward halo exchange to prepare the tensor for convolution
-    tensor_with_halo = forward_halo_exchange(torch_tensor, halo_size, parallel_strategy)
+        # Perform forward halo exchange to prepare the tensor for convolution
+        tensor_with_halo = forward_halo_exchange(
+            tensor_with_halo, halo_size, parallel_strategy, i
+        )
 
-    # Save the tensor with its halo for the backward pass.
-    tensor._tensor_with_halo = tensor_with_halo
-    tensor._tensor = tensor_with_halo.narrow(
-        shard_dim, halo_size, tensor.size(shard_dim)
-    )
+        # Save the tensor with its halo for the backward pass.
+        tensor._tensor_with_halo = tensor_with_halo
+        tensor._tensor = tensor_with_halo.narrow(
+            shard_dim_i, halo_size, tensor.size(shard_dim_i)
+        )
 
-    # Update the arguments with the tensor including halos and adjusted padding
-    args[0] = tensor_with_halo
-    padding[shard_dim - 2] = 0
-    args[4] = padding
+        # Update the arguments with the tensor including halos and adjusted padding
+        args[0] = tensor_with_halo
+        padding[shard_dim_i - 2] = 0
+        args[4] = padding
 
     # Perform the convolution operation
     out_tensor = func(*args, **kwargs)
 
     # Wrap the output tensor in a DCTensor and return it
     return DCTensor(out_tensor, parallel_strategy)
+
+
+def shard_ind_to_str(shard_ind_list):
+    return "-".join([str(s) for s in shard_ind_list])
 
 
 def distconv_backward(
@@ -288,13 +345,15 @@ def distconv_backward(
     input_torch_tensor = input_tensor._tensor
 
     # Check if the distributed convolution is supported with the given parameters
-    check_is_distconv_supported(
-        shard_dim, input_torch_tensor, weight, stride, padding, dilation
-    )
+    for i, shard_dim_i in enumerate(shard_dim):
+        check_is_distconv_supported(
+            shard_dim_i, input_torch_tensor, weight, stride, padding, dilation
+        )
 
-    # Determine the halo size for halo exchange
-    kernel_size = weight.size(shard_dim)
-    halo_size = kernel_size // 2 if (kernel_size % 2 == 1) else 0
+        # Determine the halo size for halo exchange
+        kernel_size = weight.size(shard_dim_i)
+        halo_size = kernel_size // 2 if (kernel_size % 2 == 1) else 0
+        padding[shard_dim_i - 2] = 0
 
     # Get the input tensor including halos if available, otherwise perform forward halo exchange
     if input_tensor._tensor_with_halo is not None:
@@ -307,17 +366,17 @@ def distconv_backward(
     # Update the arguments with the gradient output tensor, input tensor including halos, and adjusted padding
     args[0] = grad_out_tensor
     args[1] = input_tensor_with_halo
-    padding[shard_dim - 2] = 0
     args[5] = padding
 
     # Perform the backward convolution operation
     grad_in_tensor, grad_weight, grad_bias = func(*args, **kwargs)
 
     if grad_in_tensor is not None:
-        # Perform backward halo exchange to accumulate halo contributions into the gradient input tensor
-        grad_in_tensor = backward_halo_exchange(
-            grad_in_tensor, halo_size, parallel_strategy
-        )
+        for i, shard_dim_i in enumerate(shard_dim):
+            # Perform backward halo exchange to accumulate halo contributions into the gradient input tensor
+            grad_in_tensor = backward_halo_exchange(
+                grad_in_tensor, halo_size, parallel_strategy, i
+            )
 
         # Wrap the gradient input tensor in a DCTensor
         grad_in_tensor = DCTensor(grad_in_tensor, parallel_strategy)
@@ -394,10 +453,14 @@ class DCTensor(torch.Tensor):
         Returns:
             DCTensor: A new instance of DCTensor with the tensor sharded according to the parallel strategy.
         """
+        placements = [Shard(i) for i in parallel_strategy.shard_dim]
+        device_mesh = parallel_strategy.device_mesh[
+            parallel_strategy.distconv_dim_names
+        ]
         dtensor = distribute_tensor(
             tensor,
-            device_mesh=parallel_strategy.device_mesh["dc"],
-            placements=[Shard(parallel_strategy.shard_dim)],
+            device_mesh=device_mesh,
+            placements=placements,
         )
         return cls(dtensor.to_local(), parallel_strategy)
 
@@ -408,13 +471,18 @@ class DCTensor(torch.Tensor):
         Returns:
             torch.Tensor: The tensor resharded to the batch dimension.
         """
-        device_mesh = self._parallel_strategy.device_mesh["dc"]
+        device_mesh = self._parallel_strategy.device_mesh[
+            self._parallel_strategy.distconv_dim_names
+        ]
         shard_dim = self._parallel_strategy.shard_dim
+        placements = [Shard(i) for i in self._parallel_strategy.shard_dim]
         dtensor = DTensor.from_local(
             _ToTensor.apply(self),
             device_mesh=device_mesh,
-            placements=[Shard(shard_dim)],
-        ).redistribute(device_mesh=device_mesh, placements=[Shard(0)])
+            placements=placements,
+        ).redistribute(
+            device_mesh=device_mesh, placements=[Shard(0)] * device_mesh.ndim
+        )
         return dtensor.to_local()
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):

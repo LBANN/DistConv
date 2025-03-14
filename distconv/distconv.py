@@ -40,8 +40,9 @@ class ParallelStrategy:
         # make lookup table of GPU->shard_ind
         self.shard_ind = [None] * len(num_shards)
         mesh = meshgrid(
-            *[arange(0, num_shards_i) for num_shards_i in num_shards]
-        )[::-1]
+            *[arange(0, num_shards_i) for num_shards_i in num_shards],
+            indexing="ij"
+        )
         for i, mesh_i in enumerate(mesh):
             self.shard_ind[i] = mesh_i.ravel()[dist.get_rank()]
 

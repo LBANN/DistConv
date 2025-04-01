@@ -9,14 +9,15 @@ from distconv import DCTensor, DistConvDDP, ParallelStrategy
 
 def generate_configs():
     configs = []
-    # NOTE: Not working for 3D yet
-    for ndims in [1, 2]:
+    for ndims in [1, 2, 3]:
         for shard_dim in range(ndims):
             for kernel_size in [1, 3, 5]:
                 for stride in [1, 2]:
-                    configs.append((ndims, shard_dim, kernel_size, stride))
-
-    return "ndims,shard_dim,kernel_size,stride", configs
+                    for num_shards in [2, 4]:
+                        configs.append(
+                            (ndims, shard_dim, kernel_size, stride, num_shards)
+                        )
+    return "ndims,shard_dim,kernel_size,stride,num_shards", configs
 
 
 @pytest.mark.parametrize(*generate_configs())
@@ -25,27 +26,30 @@ def test_periodic(
     shard_dim: int,
     kernel_size: int,
     stride: int,
+    num_shards: int,
     device: torch.device,
 ):
     """
     Test distributed convolution with different number of dimensions and shard dimensions.
-    Checks the output and gradients of the distributed convolution against the non-distributed
+    Also consider hybrid spatial-data parallelism.
+    Checks the output and gradients of the distributed convolution against the reference DDP
     convolution.
 
     Args:
-        parallel_strategy (ParallelStrategy): Parallel strategy for the distributed convolution.
         ndims (int): Number of dimensions for the convolution (1, 2, or 3).
         shard_dim (int): Dimension along which the tensor is sharded.
         kernel_size (int): Size of the convolution kernel.
+        stride (int): Stride of the convolution.
+        num_shards (int): Number of spatial partitions for data
         device (torch.device): Torch device to run test with.
     """
     # Set the shard dimension for the parallel strategy
     parallel_strategy = ParallelStrategy(
-        num_shards=4,
+        num_shards=num_shards,
         shard_dim=shard_dim + 2,
-        device_type=device.type,
-        is_periodic=True,
         space_ndim=ndims,
+        is_periodic=True,
+        device_type=device.type,
     )
 
     conv_kwargs = dict(
@@ -85,11 +89,11 @@ def test_periodic(
     dc_conv_grad = conv.weight.grad
 
     # Validate the results
-    if dist.get_rank() == 0:
+    if (num_shards == 4 and dist.get_rank() == 0) or (
+        num_shards == 2 and dist.get_rank() % 2 == 0
+    ):
         assert fp32_allclose(ref_y, ddpy)
     else:
         assert ddpy.numel() == 0
-    assert fp32_allclose(
-        ref_x_grad, x_grad
-    ), f"max error is {torch.abs(ref_x_grad-x_grad).max()}"
+    assert fp32_allclose(ref_x_grad, x_grad)
     assert fp32_allclose(ref_conv_grad, dc_conv_grad)

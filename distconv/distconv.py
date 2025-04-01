@@ -51,6 +51,29 @@ class ParallelStrategy:
         self.shard_dim = shard_dim
         self.space_ndim = space_ndim
         self.is_periodic = is_periodic
+        self.rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
+        self.ddp_ranks = self.world_size // self.num_shards
+
+        self.set_shard_inds()
+
+        self.device_mesh = init_device_mesh(
+            device_type,
+            mesh_shape=(self.ddp_ranks, num_shards),
+            mesh_dim_names=("ddp", "dc"),
+        )
+
+    def _check_gpu_map(self):
+        expected_rank = self.find_rank_from_shard(self.shard_ind)
+        assert expected_rank == self.rank, f"expected rank {expected_rank} does not match actual rank {self.rank} for shard {self.shard_ind}"
+
+    def find_rank_from_shard(self, shard_ind):
+        rank_to_ddp_index = self.rank // self.num_shards
+        expected_rank = self.shard_to_gpu_map[str(shard_ind)]
+        expected_rank += rank_to_ddp_index * self.num_shards
+        return expected_rank
+
+    def set_shard_inds(self):
         self.nonshard_dim = []
         if self.is_periodic:
             for i in range(self.space_ndim):
@@ -59,16 +82,14 @@ class ParallelStrategy:
                 else:
                     self.nonshard_dim.append(i + 2)
 
-        world_size = dist.get_world_size()
-        self.ddp_ranks = world_size // num_shards
-        self.shard_ind = dist.get_rank() % num_shards
+        self.shard_ind = self.rank % self.num_shards
 
-        self.device_mesh = init_device_mesh(
-            device_type,
-            mesh_shape=(self.ddp_ranks, num_shards),
-            mesh_dim_names=("ddp", "dc"),
-        )
+        self.shard_to_gpu_map = {}
+        for i in range(self.world_size):
+            mesh_str = f"{i//self.ddp_ranks}"
+            self.shard_to_gpu_map[mesh_str] = i // self.ddp_ranks
 
+        self._check_gpu_map()
 
 def check_is_distconv_supported(
     tensor_shard_dim: int,

@@ -65,7 +65,9 @@ class ParallelStrategy:
 
     def _check_gpu_map(self):
         expected_rank = self.find_rank_from_shard(self.shard_ind)
-        assert expected_rank == self.rank, f"expected rank {expected_rank} does not match actual rank {self.rank} for shard {self.shard_ind}"
+        assert (
+            expected_rank == self.rank
+        ), f"expected rank {expected_rank} does not match actual rank {self.rank} for shard {self.shard_ind}"
 
     def find_rank_from_shard(self, shard_ind):
         rank_to_ddp_index = self.rank // self.num_shards
@@ -90,6 +92,7 @@ class ParallelStrategy:
             self.shard_to_gpu_map[mesh_str] = i // self.ddp_ranks
 
         self._check_gpu_map()
+
 
 def check_is_distconv_supported(
     tensor_shard_dim: int,
@@ -305,25 +308,41 @@ def backward_halo_exchange(
     inner_halo_minus.add_(recv_halo_minus)
     inner_halo_plus.add_(recv_halo_plus)
 
+    # handle periodic edges in the unsharded dimension
     if is_periodic:
         inner_tensor_no_periodic = inner_tensor.clone()
         for i in nonshard_dim:
             assert (
                 shard_dim != i
             ), f"{parallel_strategy.shard_dim} == {parallel_strategy.nonshard_dim}"
+            # narrow tensor to get inner part (tensor minus the border pixels)
             inner_tensor_no_periodic = inner_tensor_no_periodic.narrow(
                 i, halo_size, tensor.size(i) - 2 * halo_size
             )
 
+        # for each boundary without communication, handle periodicity of grad_x
+        for i in nonshard_dim:
             inner_halo_minus_p = inner_tensor_no_periodic.narrow(i, 0, halo_size)
             inner_halo_plus_p = inner_tensor_no_periodic.narrow(
                 i, -halo_size, halo_size
             )
 
+            # take grad_x from boundary of original grad_x tensor
             copy_inner_halo_minus_p = inner_tensor.narrow(i, 0, halo_size).clone()
             copy_inner_halo_plus_p = inner_tensor.narrow(
                 i, -halo_size, halo_size
             ).clone()
+            # for cases with nonshard_dim > 1, need to crop the remaining edges to match the tensor shape
+            for j in nonshard_dim:
+                if i == j:
+                    pass
+                else:
+                    copy_inner_halo_minus_p = copy_inner_halo_minus_p.narrow(
+                        j, halo_size, copy_inner_halo_minus_p.size(j) - 2 * halo_size
+                    )
+                    copy_inner_halo_plus_p = copy_inner_halo_plus_p.narrow(
+                        j, halo_size, copy_inner_halo_plus_p.size(j) - 2 * halo_size
+                    )
             inner_halo_minus_p.add_(copy_inner_halo_plus_p)
             inner_halo_plus_p.add_(copy_inner_halo_minus_p)
 

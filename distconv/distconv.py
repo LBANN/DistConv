@@ -192,15 +192,19 @@ def forward_halo_exchange(
         ops = []
         if shard_ind == 0:
             # Receive halo from the previous rank and send their halo back
+            shard_rhs = num_shards - 1
+            rank_rhs = parallel_strategy.find_rank_from_shard(shard_rhs)
             ops += [
-                dist.P2POp(dist.irecv, halo_minus, (num_shards - 1)),
-                dist.P2POp(dist.isend, inner_halo_minus.contiguous(), (num_shards - 1)),
+                dist.P2POp(dist.irecv, halo_minus, rank_rhs),
+                dist.P2POp(dist.isend, inner_halo_minus.contiguous(), rank_rhs),
             ]
         if shard_ind == (num_shards - 1):
             # Receive halo from the previous rank and send their halo back
+            shard_lhs = 0
+            rank_lhs = parallel_strategy.find_rank_from_shard(shard_lhs)
             ops += [
-                dist.P2POp(dist.irecv, halo_plus, 0),
-                dist.P2POp(dist.isend, inner_halo_plus.contiguous(), 0),
+                dist.P2POp(dist.irecv, halo_plus, rank_lhs),
+                dist.P2POp(dist.isend, inner_halo_plus.contiguous(), rank_lhs),
             ]
 
         # check if P2POps on this rank exist (only true for outer boundary ranks)
@@ -271,15 +275,19 @@ def backward_halo_exchange(
         ops = []
         if shard_ind == 0:
             # Receive halo from the previous rank and send their halo back
+            shard_rhs = num_shards - 1
+            rank_rhs = parallel_strategy.find_rank_from_shard(shard_rhs)
             ops += [
-                dist.P2POp(dist.irecv, recv_halo_minus, (num_shards - 1)),
-                dist.P2POp(dist.isend, send_halo_minus.contiguous(), (num_shards - 1)),
+                dist.P2POp(dist.irecv, recv_halo_minus, rank_rhs),
+                dist.P2POp(dist.isend, send_halo_minus.contiguous(), rank_rhs),
             ]
         if shard_ind == (num_shards - 1):
             # Receive halo from the previous rank and send their halo back
+            shard_lhs = 0
+            rank_lhs = parallel_strategy.find_rank_from_shard(shard_lhs)
             ops += [
-                dist.P2POp(dist.irecv, recv_halo_plus, 0),
-                dist.P2POp(dist.isend, send_halo_plus.contiguous(), 0),
+                dist.P2POp(dist.irecv, recv_halo_plus, rank_lhs),
+                dist.P2POp(dist.isend, send_halo_plus.contiguous(), rank_lhs),
             ]
 
         # check if P2POps on this rank exist (only true for outer boundary ranks)

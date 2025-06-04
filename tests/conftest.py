@@ -11,7 +11,7 @@ def pytorch_init():
         local_rank = int(os.environ["LOCAL_RANK"])
         device = torch.device(local_rank)
         torch.cuda.set_device(device)
-        dist.init_process_group("nccl", device_id=device)
+        dist.init_process_group("nccl")
     else:
         device = torch.device("cpu")
         dist.init_process_group("gloo")

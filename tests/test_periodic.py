@@ -67,6 +67,7 @@ def test_periodic(
         .to(device)
         .requires_grad_(False)
     )
+    torch.nn.init.ones_(ref_conv.weight)
     conv.weight.copy_(ref_conv.weight)
     conv.requires_grad_(True)
     ref_conv.requires_grad_(True)

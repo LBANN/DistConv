@@ -1,4 +1,5 @@
 from typing import Callable, Dict, List, Tuple
+import itertools
 
 import torch
 import torch.distributed as dist
@@ -246,6 +247,7 @@ def backward_halo_exchange(
     shard_ind = parallel_strategy.shard_ind
     is_periodic = parallel_strategy.is_periodic
     nonshard_dim = parallel_strategy.nonshard_dim
+    space_ndim = tensor.ndim - 2  # minus batch and channel dimensions
     rank = dist.get_rank()
 
     # Prepare halos for sending and receiving
@@ -308,47 +310,128 @@ def backward_halo_exchange(
     inner_halo_minus.add_(recv_halo_minus)
     inner_halo_plus.add_(recv_halo_plus)
 
-    # handle periodic edges in the unsharded dimension
+    # When boundaries are not zero padded, accumulate periodic data into inner tensor
     if is_periodic:
-        inner_tensor_no_periodic = inner_tensor.clone()
-        for i in nonshard_dim:
-            assert (
-                shard_dim != i
-            ), f"{parallel_strategy.shard_dim} == {parallel_strategy.nonshard_dim}"
-            # narrow tensor to get inner part (tensor minus the border pixels)
-            inner_tensor_no_periodic = inner_tensor_no_periodic.narrow(
-                i, halo_size, tensor.size(i) - 2 * halo_size
-            )
-
-        # for each boundary without communication, handle periodicity of grad_x
-        for i in nonshard_dim:
-            inner_halo_minus_p = inner_tensor_no_periodic.narrow(i, 0, halo_size)
-            inner_halo_plus_p = inner_tensor_no_periodic.narrow(
-                i, -halo_size, halo_size
-            )
-
-            # take grad_x from boundary of original grad_x tensor
-            copy_inner_halo_minus_p = inner_tensor.narrow(i, 0, halo_size).clone()
-            copy_inner_halo_plus_p = inner_tensor.narrow(
-                i, -halo_size, halo_size
-            ).clone()
-            # for cases with nonshard_dim > 1, need to crop the remaining edges to match the tensor shape
-            for j in nonshard_dim:
+        # Crop the non-sharded edges to extract inner tensor
+        pad_map = [-halo_size] * 2 * space_ndim
+        pad_map[(2 * (shard_dim - 2))] = 0
+        pad_map[(2 * (shard_dim - 2)) + 1] = 0
+        inner_tensor = pad(inner_tensor, pad_map[::-1])
+        for i in range(space_ndim):
+            inner_halo_minus = inner_tensor.narrow(i + 2, 0, halo_size)
+            inner_halo_plus = inner_tensor.narrow(i + 2, -halo_size, halo_size)
+            outer_halo_minus = tensor.narrow(i + 2, 0, halo_size)
+            outer_halo_plus = tensor.narrow(i + 2, -halo_size, halo_size)
+            for j in range(space_ndim):
                 if i == j:
-                    pass
-                else:
-                    copy_inner_halo_minus_p = copy_inner_halo_minus_p.narrow(
-                        j, halo_size, copy_inner_halo_minus_p.size(j) - 2 * halo_size
-                    )
-                    copy_inner_halo_plus_p = copy_inner_halo_plus_p.narrow(
-                        j, halo_size, copy_inner_halo_plus_p.size(j) - 2 * halo_size
-                    )
-            inner_halo_minus_p.add_(copy_inner_halo_plus_p)
-            inner_halo_plus_p.add_(copy_inner_halo_minus_p)
+                    continue
+                outer_halo_minus = outer_halo_minus.narrow(
+                    j + 2, halo_size, outer_halo_minus.size(j + 2) - 2 * halo_size
+                )
+                outer_halo_plus = outer_halo_plus.narrow(
+                    j + 2, halo_size, outer_halo_plus.size(j + 2) - 2 * halo_size
+                )
 
-        return inner_tensor_no_periodic
-    else:
-        return inner_tensor
+            if i + 2 in nonshard_dim:
+                inner_halo_minus.add_(outer_halo_plus)
+                inner_halo_plus.add_(outer_halo_minus)
+        # Corners of sharded-dim need additional treatment in 3D
+        if space_ndim == 3:
+            inner_tensor = accumulate_nonsharded_corners_3d(
+                tensor, inner_tensor, halo_size, parallel_strategy
+            )
+    return inner_tensor
+
+
+def get_corner_3d(
+    tensor: torch.Tensor,
+    halo_size: int,
+    space_ndim: int,
+    nonshard_dim: list[int],
+    narrow_keys: list[bool],
+):
+    """
+    Loop over each nonsharded dimension to find periodic corner data.
+
+    Args:
+        tensor (torch.Tensor): The tensor to narrow.
+        halo_size (int): Size of halo to narrow.
+        space_ndim (int): Number of spatial dimensions.
+        nonshard_dim (list): Index of spatial dimensions which are not sharded.
+        narrow_keys (list): Minus or positive side to narrow from (i.e. left or right) for each nonsharded dim.
+
+    Returns:
+        corner_tensor (torch.Tensor): Tensor narrowed to contain only corner values.
+    """
+    assert len(narrow_keys) == len(nonshard_dim)
+    corner_tensor = tensor
+    nonshard_counter = 0
+    for i in range(space_ndim):
+        if i + 2 in nonshard_dim:
+            if narrow_keys[nonshard_counter] == True:
+                start = -halo_size
+            else:
+                start = 0
+            corner_tensor = corner_tensor.narrow(i + 2, start, halo_size)
+            nonshard_counter += 1
+    return corner_tensor
+
+
+def accumulate_nonsharded_corners_3d(
+    outer_tensor: torch.Tensor,
+    inner_tensor: torch.Tensor,
+    halo_size: int,
+    parallel_strategy: ParallelStrategy,
+):
+    """
+    Accumulates nonsharded corner values from outer tensor into corners of inner tensor for periodic convolutions.
+
+    Args:
+        outer_tensor (torch.Tensor): Original tensor.
+        inner_tensor (torch.Tensor): Inner tensor after cropping the halo from each dimension.
+        halo_size (int): Halo size to crop during narrowing.
+        parallel_strategy (ParallelStrategy): Class containing information on sharded/non-sharded dimensions
+
+    Returns:
+        inner_tensor (torch.Tensor): Inner tensor with nonsharded corner values accumulated.
+    """
+    shard_dim = parallel_strategy.shard_dim
+    nonshard_dim = parallel_strategy.nonshard_dim
+    space_ndim = parallel_strategy.space_ndim
+    assert space_ndim == 3
+
+    # Pre-apply narrowing to sharded dimension such that the outer corners are the correct shape.
+    outer_tensor = outer_tensor.narrow(
+        shard_dim, halo_size, outer_tensor.size(shard_dim) - 2 * halo_size
+    )
+    # Initialise dictionary with positive and negative edge for 'inner' and 'outer' tensors
+    # Assign False and True represent minus and plus edge of tensor (e.g. left and right)
+    keys = [False, True]
+    _combo = list(itertools.product(keys, keys))
+    inner_dict = {}
+    outer_dict = {}
+    for key_i in keys:
+        inner_dict[key_i] = {}
+        outer_dict[key_i] = {}
+        for key_j in keys:
+            inner_dict[key_i][key_j] = {}
+            outer_dict[key_i][key_j] = {}
+
+    # Find corners for each combination of top/bottom and left/right
+    for key_set_i in _combo:
+        inner_dict[key_set_i[0]][key_set_i[1]] = get_corner_3d(
+            inner_tensor, halo_size, space_ndim, nonshard_dim, key_set_i
+        )
+        outer_dict[key_set_i[0]][key_set_i[1]] = get_corner_3d(
+            outer_tensor, halo_size, space_ndim, nonshard_dim, key_set_i
+        )
+
+    # Accumulate corner gradients into tensor
+    for key_set_i in _combo:
+        inner_dict[key_set_i[0]][key_set_i[1]].add_(
+            outer_dict[not key_set_i[0]][not key_set_i[1]]
+        )
+    return inner_tensor
 
 
 def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":

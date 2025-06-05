@@ -58,14 +58,15 @@ def test_periodic(
 
     # Initialize the input tensor and convolution layer
     shape = [1, 4] + [64] * ndims
-    x = torch.randn(*shape, device=device, requires_grad=True)
+    x = torch.randn(*shape, device=device, requires_grad=True, dtype=torch.float64)
     # x = torch.ones(*shape, device=device, requires_grad=True)
     conv_class = getattr(nn, f"Conv{ndims}d")
-    conv = conv_class(4, 8, **conv_kwargs).to(device).requires_grad_(False)
+    conv = conv_class(4, 8, **conv_kwargs).to(device).requires_grad_(False).double()
     ref_conv = (
         conv_class(4, 8, padding_mode="circular", **conv_kwargs)
         .to(device)
         .requires_grad_(False)
+        .double()
     )
     torch.nn.init.ones_(ref_conv.weight)
     conv.weight.copy_(ref_conv.weight)

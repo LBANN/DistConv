@@ -1,10 +1,12 @@
 from typing import Callable, Dict, List, Tuple
 import itertools
+from copy import copy
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.autograd import Function
+from torch.nn.functional import pad
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from torch.nn.functional import pad
@@ -52,6 +54,10 @@ class ParallelStrategy:
         self.shard_dim = shard_dim
         self.space_ndim = space_ndim
         self.is_periodic = is_periodic
+        if is_periodic:
+            self.padding_mode = "circular"
+        else:
+            self.padding_mode = "constant"
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
         self.ddp_ranks = self.world_size // self.num_shards
@@ -95,6 +101,36 @@ class ParallelStrategy:
         self._check_gpu_map()
 
 
+def check_is_distconv_transpose_supported(
+    tensor_shard_dim: int,
+    tensor: torch.Tensor,
+    weight: torch.Tensor,
+    stride: List[int],
+    padding: List[int],
+    dilation: List[int],
+) -> None:
+    """
+    Additional check if the distributed transpose convolution is supported with the given parameters.
+
+    Args:
+        tensor_shard_dim (int): The dimension along which the tensor is sharded.
+        tensor (torch.Tensor): The input tensor.
+        weight (torch.Tensor): The convolution kernel tensor.
+        stride (List[int]): The stride of the convolution.
+        padding (List[int]): The padding added to the input tensor.
+        dilation (List[int]): The dilation applied to the kernel.
+
+    Raises:
+        Exception: If kernel size is even.
+    """
+    shard_dim = tensor_shard_dim - 2
+    kernel_size = weight.size(tensor_shard_dim)
+    if kernel_size % 2 == 0:
+        raise Exception(
+            f"DistConv Transpose: even kernel ({kernel_size}) not supported currently."
+        )
+
+
 def check_is_distconv_supported(
     tensor_shard_dim: int,
     tensor: torch.Tensor,
@@ -123,21 +159,23 @@ def check_is_distconv_supported(
     """
     shard_dim = tensor_shard_dim - 2
     kernel_size = weight.size(tensor_shard_dim)
-    if dilation[shard_dim] != 1:
-        raise Exception("DistConv: dilation must be 1")
-    if tensor.size(tensor_shard_dim) % stride[shard_dim] != 0:
-        raise Exception("DistConv: input size must be divisible by stride")
+    if dilation[0] != 1:
+        raise Exception(f"DistConv: dilation[0] ({dilation}) must be 1")
+    if tensor.size(tensor_shard_dim) % stride[0] != 0:
+        raise Exception(
+            f"DistConv: input size ({tensor.shape}) must be divisible by stride ({stride})"
+        )
     if kernel_size % 2 == 1:
-        if (kernel_size // 2) != padding[shard_dim]:
+        if (kernel_size // 2) != padding[0]:
             raise Exception(
-                'DistConv: when kernel size is odd, padding must be equivalent to "same"'
+                f'DistConv: when kernel size is odd, padding ({(kernel_size // 2)}) must be  equivalent to "same", but is {padding}, weight size is {weight.shape} for shard {tensor_shard_dim}'
             )
     else:
-        if padding[shard_dim] != 0:
+        if padding[0] != 0:
             raise Exception("DistConv: when kernel size is even, padding must be zero")
-        if stride[shard_dim] % kernel_size != 0:
+        if stride[0] % kernel_size != 0:
             raise Exception(
-                "DistConv: when kernel size is even, stride must be divisble by kernel size"
+                f"DistConv: when kernel size is even ({weight.shape}), stride ({stride}) must be divisble by kernel size"
             )
 
 
@@ -310,36 +348,35 @@ def backward_halo_exchange(
     inner_halo_minus.add_(recv_halo_minus)
     inner_halo_plus.add_(recv_halo_plus)
 
-    # When boundaries are not zero padded, accumulate periodic data into inner tensor
-    if is_periodic:
-        # Crop the non-sharded edges to extract inner tensor
-        pad_map = [-halo_size] * 2 * space_ndim
-        pad_map[(2 * (shard_dim - 2))] = 0
-        pad_map[(2 * (shard_dim - 2)) + 1] = 0
-        inner_tensor = pad(inner_tensor, pad_map[::-1])
-        for i in range(space_ndim):
-            inner_halo_minus = inner_tensor.narrow(i + 2, 0, halo_size)
-            inner_halo_plus = inner_tensor.narrow(i + 2, -halo_size, halo_size)
-            outer_halo_minus = tensor.narrow(i + 2, 0, halo_size)
-            outer_halo_plus = tensor.narrow(i + 2, -halo_size, halo_size)
-            for j in range(space_ndim):
-                if i == j:
-                    continue
-                outer_halo_minus = outer_halo_minus.narrow(
-                    j + 2, halo_size, outer_halo_minus.size(j + 2) - 2 * halo_size
-                )
-                outer_halo_plus = outer_halo_plus.narrow(
-                    j + 2, halo_size, outer_halo_plus.size(j + 2) - 2 * halo_size
-                )
-
-            if i + 2 in nonshard_dim:
-                inner_halo_minus.add_(outer_halo_plus)
-                inner_halo_plus.add_(outer_halo_minus)
-        # Corners of sharded-dim need additional treatment in 3D
-        if space_ndim == 3:
-            inner_tensor = accumulate_nonsharded_corners_3d(
-                tensor, inner_tensor, halo_size, parallel_strategy
+    # Crop the non-sharded edges to extract inner tensor
+    pad_map = [-halo_size] * 2 * space_ndim
+    pad_map[(2 * (shard_dim - 2))] = 0
+    pad_map[(2 * (shard_dim - 2)) + 1] = 0
+    inner_tensor = pad(inner_tensor, pad_map[::-1])
+    for i in range(space_ndim):
+        inner_halo_minus = inner_tensor.narrow(i + 2, 0, halo_size)
+        inner_halo_plus = inner_tensor.narrow(i + 2, -halo_size, halo_size)
+        outer_halo_minus = tensor.narrow(i + 2, 0, halo_size)
+        outer_halo_plus = tensor.narrow(i + 2, -halo_size, halo_size)
+        for j in range(space_ndim):
+            if i == j:
+                continue
+            outer_halo_minus = outer_halo_minus.narrow(
+                j + 2, halo_size, outer_halo_minus.size(j + 2) - 2 * halo_size
             )
+            outer_halo_plus = outer_halo_plus.narrow(
+                j + 2, halo_size, outer_halo_plus.size(j + 2) - 2 * halo_size
+            )
+
+        # When boundaries are not zero padded, accumulate periodic data into inner tensor
+        if i + 2 in nonshard_dim and is_periodic:
+            inner_halo_minus.add_(outer_halo_plus)
+            inner_halo_plus.add_(outer_halo_minus)
+    # Corners of sharded-dim need additional treatment in 3D
+    if space_ndim == 3 and is_periodic:
+        inner_tensor = accumulate_nonsharded_corners_3d(
+            tensor, inner_tensor, halo_size, parallel_strategy
+        )
     return inner_tensor
 
 
@@ -347,8 +384,8 @@ def get_corner_3d(
     tensor: torch.Tensor,
     halo_size: int,
     space_ndim: int,
-    nonshard_dim: list[int],
-    narrow_keys: list[bool],
+    nonshard_dim: List[int],
+    narrow_keys: List[bool],
 ):
     """
     Loop over each nonsharded dimension to find periodic corner data.
@@ -450,12 +487,25 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
     args = list(args)
 
     # Unpack the necessary arguments
-    tensor, weight, bias, stride, padding, dilation = args[:6]
+    tensor, weight, bias, stride, padding, dilation, transpose, output_padding = args[
+        :8
+    ]
+
+    # when doing double-backprop (e.g. torch.autograd.grad(...).backwards())
+    # need to use core pytorch functionality
+    if (
+        weight.shape[-1] * dilation[-1] == tensor.shape[-1]
+    ):  # NOTE: not rigorously tested
+        args[0] = args[0].to_replicate()
+        args[1] = args[1].to_replicate()
+        return DCTensor(func(*args, **kwargs), tensor._parallel_strategy)
 
     # Extract the parallel strategy and shard dimension from the input tensor
     parallel_strategy = tensor._parallel_strategy
     shard_dim = parallel_strategy.shard_dim
     is_periodic = parallel_strategy.is_periodic
+    shard_ind = parallel_strategy.shard_ind
+    world_size = parallel_strategy.world_size
 
     # Unwrap the underlying tensor from the DCTensor
     torch_tensor = tensor._tensor
@@ -472,24 +522,54 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
     # Perform forward halo exchange to prepare the tensor for convolution
     tensor_with_halo = forward_halo_exchange(torch_tensor, halo_size, parallel_strategy)
 
+    # Update the arguments with the tensor including halos and adjusted padding
+    padding_orig = copy(padding)
+    output_padding_orig = copy(output_padding)
+    if transpose:
+        output_padding = forward_transpose_output_padding(
+            tensor,
+            dilation,
+            stride,
+            padding_orig,
+            output_padding,
+            kernel_size,
+            parallel_strategy,
+        )
+    padding[shard_dim - 2] = 0
+    tensor_with_halo = pad(
+        tensor_with_halo,
+        _reverse_repeat_tuple(padding, 2),
+        mode=parallel_strategy.padding_mode,
+    )
+    for i in range(0, parallel_strategy.space_ndim):
+        if transpose:
+            padding[i] = dilation[i] * (kernel_size - 1)
+        else:
+            padding[i] = 0
+    args[0] = tensor_with_halo
+    args[4] = padding
+    args[7] = output_padding
+
     # Save the tensor with its halo for the backward pass.
     tensor._tensor_with_halo = tensor_with_halo
     tensor._tensor = tensor_with_halo.narrow(
         shard_dim, halo_size, tensor.size(shard_dim)
     )
 
-    # Update the arguments with the tensor including halos and adjusted padding
-    padding[shard_dim - 2] = 0
-    if is_periodic:
-        tensor_with_halo = pad(
-            tensor_with_halo, _reverse_repeat_tuple(padding, 2), mode="circular"
-        )
-        padding = [0] * len(padding)
-    args[0] = tensor_with_halo
-    args[4] = padding
-
     # Perform the convolution operation
     out_tensor = func(*args, **kwargs)
+
+    # handle output cropping for transpose
+    if transpose:
+        out_tensor = forward_transpose_padding(
+            out_tensor,
+            padding,
+            dilation,
+            stride,
+            padding_orig,
+            kernel_size,
+            parallel_strategy,
+        )
 
     # Wrap the output tensor in a DCTensor and return it
     return DCTensor(out_tensor, parallel_strategy)
@@ -513,14 +593,24 @@ def distconv_backward(
     args = list(args)
 
     # Unpack the necessary arguments
-    grad_out_tensor, input_tensor, weight, bias_size, stride, padding, dilation = args[
-        :7
-    ]
+    (
+        grad_out_tensor,
+        input_tensor,
+        weight,
+        bias_size,
+        stride,
+        padding,
+        dilation,
+        transpose,
+        output_padding,
+    ) = args[:9]
 
     # Extract the parallel strategy and shard dimension from the gradient output tensor
     parallel_strategy = grad_out_tensor._parallel_strategy
     shard_dim = parallel_strategy.shard_dim
     is_periodic = parallel_strategy.is_periodic
+    shard_ind = parallel_strategy.shard_ind
+    world_size = parallel_strategy.world_size
 
     # Unwrap the underlying tensors from the DCTensors
     grad_out_tensor = grad_out_tensor._tensor
@@ -530,6 +620,10 @@ def distconv_backward(
     check_is_distconv_supported(
         shard_dim, input_torch_tensor, weight, stride, padding, dilation
     )
+    if transpose:
+        check_is_distconv_transpose_supported(
+            shard_dim, input_torch_tensor, weight, stride, padding, dilation
+        )
 
     # Determine the halo size for halo exchange
     kernel_size = weight.size(shard_dim)
@@ -544,16 +638,32 @@ def distconv_backward(
         )
 
     # Update the arguments with the gradient output tensor, input tensor including halos, and adjusted padding
+    padding_orig = copy(padding)
+    output_padding_orig = copy(output_padding)
+    for i in range(0, parallel_strategy.space_ndim):
+        if transpose:
+            padding[i] = dilation[i] * (kernel_size - 1)
+        else:
+            padding[i] = 0
     padding[shard_dim - 2] = 0
-    if is_periodic:
-        input_tensor_with_halo = pad(
-            input_tensor_with_halo, _reverse_repeat_tuple(padding, 2), mode="circular"
-        )
-        padding = [0] * len(padding)
+    output_padding[shard_dim - 2] = 0
 
+    if transpose:
+        grad_out_tensor, padding = backward_transpose_padding(
+            grad_out_tensor,
+            input_tensor_with_halo,
+            padding,
+            dilation,
+            stride,
+            padding_orig,
+            output_padding_orig,
+            kernel_size,
+            parallel_strategy,
+        )
     args[0] = grad_out_tensor
     args[1] = input_tensor_with_halo
     args[5] = padding
+    args[8] = output_padding
 
     # Perform the backward convolution operation
     grad_in_tensor, grad_weight, grad_bias = func(*args, **kwargs)
@@ -569,6 +679,200 @@ def distconv_backward(
 
     # Return the gradients with respect to the input tensor, weight, and bias
     return grad_in_tensor, grad_weight, grad_bias
+
+
+def forward_transpose_output_padding(
+    input_tensor: torch.Tensor,
+    dilation: List[int],
+    stride: List[int],
+    padding_orig: List[int],
+    output_padding: List[int],
+    kernel_size: int,
+    parallel_strategy: ParallelStrategy,
+) -> List[int]:
+    """
+    Modify output_padding in sharded dimension to be passed into transpose convolution.
+    This adds an additional N rows/columns to the tensor with zeros, based on equations specified in
+    https://arxiv.org/abs/1603.07285.
+    This does not apply to the last shard along the sharded dimension, as this is naturally handled by
+    the original output_padding.
+
+    Args:
+        input_tensor (torch.Tensor): Tensor whose size will be used to calculate the required output padding.
+        dilation (list): Dilation applied to convolution kernel.
+        stride (list): Stride used for convolution.
+        padding_orig (list): Original padding defined in convolution layer, before being modified within distconv.
+        output_padding (list): Output padding added to last row and column after transpose convolution to give
+            the output tensor the correct shape.
+        kernel_size (int): Width of convolution kernel.
+        parallel_strategy (ParallelStrategy): The parallel strategy for distributing the tensor.
+
+    Returns:
+        List[int]: Output padding to be applied to the local tensor after convolution.
+    """
+    shard_dim = parallel_strategy.shard_dim
+    world_size = parallel_strategy.world_size
+    shard_ind = parallel_strategy.shard_ind
+
+    for dim_i in range(input_tensor.ndim - 2):
+        if dim_i == shard_dim - 2:
+            if shard_ind + 1 < world_size:
+                updated_padding = (
+                    dilation[dim_i] * (kernel_size - 1) - padding_orig[dim_i]
+                )
+                output_padding[dim_i] += (
+                    input_tensor.size(shard_dim) + 2 * updated_padding - kernel_size
+                ) % stride[shard_dim - 2]
+    return output_padding
+
+
+def forward_transpose_padding(
+    out_tensor: torch.Tensor,
+    padding: List[int],
+    dilation: List[int],
+    stride: List[int],
+    padding_orig: List[int],
+    kernel_size: int,
+    parallel_strategy: ParallelStrategy,
+) -> torch.Tensor:
+    """
+    Crops tensor output from transpose convolution function to enforce shape to match reference (unsharded) solution.
+    Based on equations specified in https://arxiv.org/abs/1603.07285.
+
+    Args:
+        out_tensor (torch.Tensor): Tensor after forward transpose convolution.
+        padding (list): Padding passed into forward transpose convolution.
+        dilation (list): Dilation applied to convolution kernel.
+        stride (list): Stride used for convolution.
+        padding_orig (list): Original padding defined in convolution layer, before being modified within distconv.
+        kernel_size (int): Width of convolution kernel.
+        parallel_strategy (ParallelStrategy): The parallel strategy for distributing the tensor.
+
+    Returns:
+        torch.Tensor: Cropped tensor with shape matching reference solution.
+    """
+    shard_dim = parallel_strategy.shard_dim
+    world_size = parallel_strategy.world_size
+    shard_ind = parallel_strategy.shard_ind
+
+    pad_map = [0, 0] * (out_tensor.ndim - 2)
+    for dim_i in range(out_tensor.ndim - 2):
+        pad_map[(dim_i * 2)] -= (
+            dilation[dim_i]
+            * (kernel_size - 1 - padding_orig[dim_i])
+            * (stride[dim_i] - 1)
+        )
+        pad_map[(dim_i * 2) + 1] -= (
+            dilation[dim_i]
+            * (kernel_size - 1 - padding_orig[dim_i])
+            * (stride[dim_i] - 1)
+        )
+
+    # for layout e.g. NCHW, padding input should be (W0,W1,H0,H1)...
+    pad_map = pad_map[::-1]
+    out_tensor = pad(out_tensor, pad=pad_map, mode=parallel_strategy.padding_mode)
+    return out_tensor
+
+
+def backward_transpose_padding(
+    grad_out_tensor: torch.Tensor,
+    input_tensor: torch.Tensor,
+    padding: List[int],
+    dilation: List[int],
+    stride: List[int],
+    padding_orig: List[int],
+    output_padding_orig: List[int],
+    kernel_size: int,
+    parallel_strategy: ParallelStrategy,
+) -> [torch.Tensor, List[int]]:
+    """
+    Pads tensor before input to backward transpose convolution function to enforce shape to match reference (unsharded) solution.
+    Based on equations specified in https://arxiv.org/abs/1603.07285.
+
+    Args:
+        grad_out_tensor (torch.Tensor): Output gradient tensor.
+        input_tensor (torch.Tensor): Input tensor from distconv_forward.
+        padding (list): Padding passed into forward transpose convolution.
+        dilation (list): Dilation applied to convolution kernel.
+        stride (list): Stride used for convolution.
+        padding_orig (list): Original padding defined in convolution layer, before being modified within distconv.
+        output_padding_orig (list): Original output padding defined in convolution layer, before being modified within distconv.
+        kernel_size (int): Width of convolution kernel.
+        parallel_strategy (ParallelStrategy): The parallel strategy for distributing the tensor.
+
+    Returns:
+        torch.Tensor: Cropped tensor with shape matching reference solution.
+        List[int]: New padding arguments to be passed into backward transpose convolution.
+    """
+
+    shard_dim = parallel_strategy.shard_dim
+    world_size = parallel_strategy.world_size
+    shard_ind = parallel_strategy.shard_ind
+
+    pad_map = [0, 0] * (grad_out_tensor.ndim - 2)
+    output_pad_map = [0, 0] * (grad_out_tensor.ndim - 2)
+    for dim_i in range(grad_out_tensor.ndim - 2):
+        if dim_i == shard_dim - 2:
+            if shard_ind < world_size - 1:
+                # For strided transpose convolution, the shape is ambiguous.
+                # See relationship 14 in paper in docstring.
+                updated_padding = (
+                    dilation[dim_i] * (kernel_size - 1) - padding_orig[dim_i]
+                )
+                output_pad_map[dim_i * 2] -= (
+                    input_tensor.size(shard_dim) + 2 * updated_padding - kernel_size
+                ) % stride[shard_dim - 2]
+            else:
+                # For last shard in dimension, we already have the original output padding.
+                output_pad_map[dim_i * 2] -= output_padding_orig[shard_dim - 2]
+            pad_map[dim_i * 2] += dilation[dim_i] * (kernel_size - 1)
+            pad_map[dim_i * 2 + 1] += dilation[dim_i] * (kernel_size - 1)
+        else:
+            # Pre-pad the unsharded dimensions and update the padding variable
+            pad_map[(dim_i * 2)] += padding[dim_i]
+            pad_map[(dim_i * 2) + 1] += padding[dim_i]
+            # Overwrite the padding to be passed into func() so we do not duplicate it.
+            padding[dim_i] = 0
+        # Apply this to all strided transpose convolutions to obtain correct output shape
+        # (see relationship 14 in paper above).
+        pad_map[(dim_i * 2)] += (
+            dilation[dim_i]
+            * (kernel_size - 1 - padding_orig[dim_i])
+            * (stride[dim_i] - 1)
+        )
+        pad_map[(dim_i * 2) + 1] += (
+            dilation[dim_i]
+            * (kernel_size - 1 - padding_orig[dim_i])
+            * (stride[dim_i] - 1)
+        )
+
+    # for layout e.g. NCHW, padding input should be (W0,W1,H0,H1)...
+    pad_map = pad_map[::-1]
+    output_pad_map = output_pad_map[::-1]
+    # order here is opposite of forward pass (where output padding is
+    # handled first, within the convolution op)
+    grad_out_tensor = pad(grad_out_tensor, pad=pad_map, mode="constant")
+    # padding is constant, even when periodic padding is used as
+    # periodicity accounted for in backward_halo_exchange
+    check_backward_output_pad_map(output_pad_map)
+    grad_out_tensor = pad(grad_out_tensor, pad=output_pad_map, mode="constant")
+    return grad_out_tensor, padding
+
+
+def check_backward_output_pad_map(output_pad_map: List[int]):
+    """
+    Check that the output padding applied to the grad_out_tensor during backward pass is negative (cropping).
+
+    Args:
+        output_pad_map (list): Output cropping to be applied to the grad_out_tensor, expected length is 2*ndims.
+
+    Raises:
+        Exception: If positive values found in padding map.
+    """
+    output_pad_map = torch.tensor(output_pad_map)
+    assert torch.all(
+        output_pad_map <= 0
+    ), f"output_pad_map expected to be negative in backward pass ({output_pad_map})"
 
 
 class DCTensor(torch.Tensor):
@@ -662,7 +966,7 @@ class DCTensor(torch.Tensor):
         ).redistribute(device_mesh=device_mesh, placements=[Shard(0)])
         return dtensor.to_local()
 
-    def to_replicate(self) -> torch.Tensor:
+    def to_replicate(self, shape=None, stride=None) -> torch.Tensor:
         """
         Convert the DCTensor to a simple replicated tensor.
 
@@ -675,6 +979,8 @@ class DCTensor(torch.Tensor):
             _ToTensor.apply(self),
             device_mesh=device_mesh,
             placements=[Shard(shard_dim)],
+            shape=shape,
+            stride=stride,
         ).redistribute(device_mesh=device_mesh, placements=[Replicate()])
         return dtensor.to_local()
 

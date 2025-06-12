@@ -1,6 +1,7 @@
 from typing import Callable, Dict, List, Tuple
 import itertools
 from copy import copy
+from warnings import warn
 
 import torch
 import torch.distributed as dist
@@ -108,6 +109,7 @@ def check_is_distconv_transpose_supported(
     stride: List[int],
     padding: List[int],
     dilation: List[int],
+    is_periodic: bool,
 ) -> None:
     """
     Additional check if the distributed transpose convolution is supported with the given parameters.
@@ -119,6 +121,7 @@ def check_is_distconv_transpose_supported(
         stride (List[int]): The stride of the convolution.
         padding (List[int]): The padding added to the input tensor.
         dilation (List[int]): The dilation applied to the kernel.
+        is_periodic (bool): Padding applied will be periodic.
 
     Raises:
         Exception: If kernel size is even.
@@ -128,6 +131,11 @@ def check_is_distconv_transpose_supported(
     if kernel_size % 2 == 0:
         raise Exception(
             f"DistConv Transpose: even kernel ({kernel_size}) not supported currently."
+        )
+    if is_periodic and stride[shard_dim] > 1:
+        warn(
+            "Strided transpose convolution with periodic boundaries is experimental, "
+            "as this is not currently supported in native PyTorch."
         )
 
 
@@ -514,6 +522,10 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
     check_is_distconv_supported(
         shard_dim, torch_tensor, weight, stride, padding, dilation
     )
+    if transpose:
+        check_is_distconv_transpose_supported(
+            shard_dim, torch_tensor, weight, stride, padding, dilation, is_periodic
+        )
 
     # Determine the halo size for halo exchange
     kernel_size = weight.size(shard_dim)
@@ -622,7 +634,13 @@ def distconv_backward(
     )
     if transpose:
         check_is_distconv_transpose_supported(
-            shard_dim, input_torch_tensor, weight, stride, padding, dilation
+            shard_dim,
+            input_torch_tensor,
+            weight,
+            stride,
+            padding,
+            dilation,
+            is_periodic,
         )
 
     # Determine the halo size for halo exchange

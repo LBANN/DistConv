@@ -30,7 +30,7 @@ def all_gather_vlen(tensor: torch.Tensor, group=None, dim=0) -> list[torch.Tenso
 
 @pytest.fixture(scope="module")
 def parallel_strategy(device: torch.device):
-    ps = ParallelStrategy(num_shards=2, device_type=device.type)
+    ps = ParallelStrategy(num_shards=4, device_type=device.type)
     yield ps
     cleanup_parallel_strategy(ps)
 

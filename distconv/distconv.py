@@ -176,36 +176,23 @@ def forward_halo_exchange(
             dist.P2POp(dist.isend, inner_halo_plus.contiguous(), rank + 1),
             dist.P2POp(dist.irecv, halo_plus, rank + 1),
         ]
+    elif is_periodic:
+        ops += [
+            dist.P2POp(dist.isend, inner_halo_plus.contiguous(), rank - num_shards + 1),
+            dist.P2POp(dist.irecv, halo_plus, rank - num_shards + 1),
+        ]
+    if shard_ind == 0 and is_periodic:
+        ops += [
+            dist.P2POp(dist.irecv, halo_minus, rank + num_shards - 1),
+            dist.P2POp(
+                dist.isend, inner_halo_minus.contiguous(), rank + num_shards - 1
+            ),
+        ]
 
     # Execute communication operations
     reqs = dist.batch_isend_irecv(ops)
     for req in reqs:
         req.wait()
-
-    if is_periodic:
-        ops = []
-        if shard_ind == 0:
-            # Receive halo from the previous rank and send their halo back
-            shard_rhs = num_shards - 1
-            rank_rhs = parallel_strategy.find_rank_from_shard(shard_rhs)
-            ops += [
-                dist.P2POp(dist.irecv, halo_minus, rank_rhs),
-                dist.P2POp(dist.isend, inner_halo_minus.contiguous(), rank_rhs),
-            ]
-        if shard_ind == (num_shards - 1):
-            # Receive halo from the previous rank and send their halo back
-            shard_lhs = 0
-            rank_lhs = parallel_strategy.find_rank_from_shard(shard_lhs)
-            ops += [
-                dist.P2POp(dist.irecv, halo_plus, rank_lhs),
-                dist.P2POp(dist.isend, inner_halo_plus.contiguous(), rank_lhs),
-            ]
-
-        # check if P2POps on this rank exist (only true for outer boundary ranks)
-        if len(ops) > 0:
-            reqs = dist.batch_isend_irecv(ops)
-            for req in reqs:
-                req.wait()
 
     # Concatenate received halos with the original tensor
     tensor_with_halo = torch.cat([halo_minus, tensor, halo_plus], dim=shard_dim)
@@ -260,36 +247,21 @@ def backward_halo_exchange(
             dist.P2POp(dist.isend, send_halo_plus.contiguous(), rank + 1),
             dist.P2POp(dist.irecv, recv_halo_plus, rank + 1),
         ]
+    elif is_periodic:
+        ops += [
+            dist.P2POp(dist.isend, send_halo_plus.contiguous(), rank - num_shards + 1),
+            dist.P2POp(dist.irecv, recv_halo_plus, rank - num_shards + 1),
+        ]
+    if shard_ind == 0 and is_periodic:
+        ops += [
+            dist.P2POp(dist.irecv, recv_halo_minus, rank + num_shards - 1),
+            dist.P2POp(dist.isend, send_halo_minus.contiguous(), rank + num_shards - 1),
+        ]
 
     # Execute communication operations
     reqs = dist.batch_isend_irecv(ops)
     for req in reqs:
         req.wait()
-
-    if is_periodic:
-        ops = []
-        if shard_ind == 0:
-            # Receive halo from the previous rank and send their halo back
-            shard_rhs = num_shards - 1
-            rank_rhs = parallel_strategy.find_rank_from_shard(shard_rhs)
-            ops += [
-                dist.P2POp(dist.irecv, recv_halo_minus, rank_rhs),
-                dist.P2POp(dist.isend, send_halo_minus.contiguous(), rank_rhs),
-            ]
-        if shard_ind == (num_shards - 1):
-            # Receive halo from the previous rank and send their halo back
-            shard_lhs = 0
-            rank_lhs = parallel_strategy.find_rank_from_shard(shard_lhs)
-            ops += [
-                dist.P2POp(dist.irecv, recv_halo_plus, rank_lhs),
-                dist.P2POp(dist.isend, send_halo_plus.contiguous(), rank_lhs),
-            ]
-
-        # check if P2POps on this rank exist (only true for outer boundary ranks)
-        if len(ops) > 0:
-            reqs = dist.batch_isend_irecv(ops)
-            for req in reqs:
-                req.wait()
 
     # Accumulate received halos into the inner tensor
     inner_tensor = tensor.narrow(

@@ -98,3 +98,5 @@ def test_periodic(
         assert ddpy.numel() == 0
     assert fp32_allclose(ref_x_grad, x_grad)
     assert fp32_allclose(ref_conv_grad, dc_conv_grad)
+
+    cleanup_parallel_strategy(parallel_strategy)

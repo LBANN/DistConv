@@ -9,17 +9,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from torch.nn.functional import pad
 from torch.utils._pytree import tree_map
-
-
-def _reverse_repeat_tuple(t, n):
-    r"""Reverse the order of `t` and repeat each element for `n` times.
-
-    This can be used to translate padding arg used by Conv and Pooling modules
-    to the ones used by `F.pad`.
-
-    Credit: https://github.com/pytorch/pytorch/blob/v2.6.0/torch/nn/modules/utils.py
-    """
-    return tuple(x for x in reversed(t) for _ in range(n))
+from torch.nn.modules.utils import _reverse_repeat_tuple
 
 
 class ParallelStrategy:
@@ -66,9 +56,9 @@ class ParallelStrategy:
 
     def _check_gpu_map(self):
         expected_rank = self.find_rank_from_shard(self.shard_ind)
-        assert (
-            expected_rank == self.rank
-        ), f"expected rank {expected_rank} does not match actual rank {self.rank} for shard {self.shard_ind}"
+        assert expected_rank == self.rank, (
+            f"expected rank {expected_rank} does not match actual rank {self.rank} for shard {self.shard_ind}"
+        )
 
     def find_rank_from_shard(self, shard_ind):
         rank_to_ddp_index = self.rank // self.num_shards
@@ -89,7 +79,7 @@ class ParallelStrategy:
 
         self.shard_to_gpu_map = {}
         for i in range(self.world_size):
-            mesh_str = f"{i//self.ddp_ranks}"
+            mesh_str = f"{i // self.ddp_ranks}"
             self.shard_to_gpu_map[mesh_str] = i // self.ddp_ranks
 
         self._check_gpu_map()
@@ -703,9 +693,9 @@ class DCTensor(torch.Tensor):
 
         def unwrap(t):
             if isinstance(t, DCTensor):
-                assert (
-                    self._parallel_strategy == t._parallel_strategy
-                ), "Parallel strategy mismatch"
+                assert self._parallel_strategy == t._parallel_strategy, (
+                    "Parallel strategy mismatch"
+                )
                 return t._tensor
             else:
                 return t

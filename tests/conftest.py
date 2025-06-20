@@ -8,6 +8,7 @@ import torch.distributed as dist
 @pytest.fixture(scope="session", autouse=True)
 def pytorch_init():
     if torch.cuda.is_available():
+        torch.backends.cudnn.allow_tf32 = False
         local_rank = int(os.environ["LOCAL_RANK"])
         device = torch.device(local_rank)
         torch.cuda.set_device(device)

@@ -2,7 +2,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
+from torch.distributed.tensor import Replicate, Shard, distribute_tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from utils import cleanup_parallel_strategy, fp32_allclose
 

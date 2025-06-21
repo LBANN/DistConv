@@ -1,15 +1,11 @@
 from typing import Callable, Dict, List, Tuple
-import itertools
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch.autograd import Function
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
-from torch.nn.functional import pad
 from torch.utils._pytree import tree_map
-from torch.nn.modules.utils import _reverse_repeat_tuple
 
 
 class ParallelStrategy:

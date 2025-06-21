@@ -251,7 +251,10 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
     shard_dim = parallel_strategy.shard_dim
     is_periodic = tensor._is_periodic
     if is_periodic:
-        padding[shard_dim - 2] = tensor._shard_padding[0]
+        assert padding[shard_dim - 2] == 0, (
+            "Cannot zero-pad a tensor marked for periodic padding on the shard dimension"
+        )
+        padding[shard_dim - 2] = tensor._periodic_shard_padding
 
     # Unwrap the underlying tensor from the DCTensor
     torch_tensor = tensor._tensor
@@ -315,7 +318,10 @@ def distconv_backward(
     shard_dim = parallel_strategy.shard_dim
     is_periodic = input_tensor._is_periodic
     if is_periodic:
-        padding[shard_dim - 2] = input_tensor._shard_padding[0]
+        assert padding[shard_dim - 2] == 0, (
+            "Cannot zero-pad a tensor marked for periodic padding on the shard dimension"
+        )
+        padding[shard_dim - 2] = input_tensor._periodic_shard_padding
 
     # Unwrap the underlying tensors from the DCTensors
     grad_out_tensor = grad_out_tensor._tensor
@@ -369,7 +375,7 @@ class DCTensor(torch.Tensor):
     _tensor_with_halo: torch.Tensor = None
     _parallel_strategy: ParallelStrategy
     _is_periodic: bool = False
-    _shard_padding: Tuple[int, int] = (0, 0)
+    _periodic_shard_padding: int = 0
 
     @staticmethod
     def __new__(
@@ -398,7 +404,7 @@ class DCTensor(torch.Tensor):
         dc_tensor._tensor = tensor
         dc_tensor._parallel_strategy = parallel_strategy
         dc_tensor._is_periodic = False
-        dc_tensor._shard_padding = (0, 0)
+        dc_tensor._periodic_shard_padding = 0
 
         return dc_tensor
 
@@ -530,13 +536,17 @@ class DCTensor(torch.Tensor):
         if len(pad_list) > shard_pad_end_idx:
             shard_pad_minus = pad_list[shard_pad_start_idx]
             shard_pad_plus = pad_list[shard_pad_end_idx]
-            shard_padding = (shard_pad_minus, shard_pad_plus)
+
+            assert shard_pad_minus == shard_pad_plus, (
+                "Periodic padding must be symmetric on sharded dimension"
+            )
+            shard_padding = shard_pad_minus
 
             # Disable padding on shard dimension for F.pad
             pad_list[shard_pad_start_idx] = 0
             pad_list[shard_pad_end_idx] = 0
         else:
-            shard_padding = (0, 0)
+            shard_padding = 0
 
         # Call F.pad with modified padding (shard dim padding disabled)
         new_args = (_ToTensor.apply(input_tensor), tuple(pad_list)) + args[2:]
@@ -544,8 +554,8 @@ class DCTensor(torch.Tensor):
 
         # Create result DCTensor with periodic flag and stored shard padding
         result: DCTensor = _FromTensor.apply(partial_padded_tensor, parallel_strategy)
-        result._is_periodic = True
-        result._shard_padding = shard_padding
+        result._is_periodic = shard_padding > 0
+        result._periodic_shard_padding = shard_padding
 
         return result
 

@@ -53,31 +53,27 @@ def test_periodic(
     )
 
     conv_kwargs = dict(
-        kernel_size=kernel_size, padding=kernel_size // 2, bias=False, stride=stride
+        kernel_size=kernel_size,
+        padding=kernel_size // 2,
+        bias=False,
+        stride=stride,
+        padding_mode="circular",
     )
 
     # Initialize the input tensor and convolution layer
     shape = [1, 4] + [64] * ndims
     x = torch.randn(*shape, device=device, requires_grad=True)
-    # x = torch.ones(*shape, device=device, requires_grad=True)
     conv_class = getattr(nn, f"Conv{ndims}d")
     conv = conv_class(4, 8, **conv_kwargs).to(device).requires_grad_(False)
-    ref_conv = (
-        conv_class(4, 8, padding_mode="circular", **conv_kwargs)
-        .to(device)
-        .requires_grad_(False)
-    )
-    torch.nn.init.ones_(ref_conv.weight)
-    conv.weight.copy_(ref_conv.weight)
+    torch.nn.init.ones_(conv.weight)
     conv.requires_grad_(True)
-    ref_conv.requires_grad_(True)
 
     # Perform forward and backward pass for reference (non-distributed) convolution
-    ref_conv.zero_grad()
-    ref_y = ref_conv(x)
+    conv.zero_grad()
+    ref_y = conv(x)
     ref_y.square().mean().backward()
     ref_x_grad = x.grad
-    ref_conv_grad = ref_conv.weight.grad
+    ref_conv_grad = conv.weight.grad.clone()
 
     # Perform forward and backward pass for distributed convolution
     conv.zero_grad()

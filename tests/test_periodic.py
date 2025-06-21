@@ -45,11 +45,7 @@ def test_periodic(
     """
     # Set the shard dimension for the parallel strategy
     parallel_strategy = ParallelStrategy(
-        num_shards=num_shards,
-        shard_dim=shard_dim + 2,
-        space_ndim=ndims,
-        is_periodic=True,
-        device_type=device.type,
+        num_shards=num_shards, shard_dim=shard_dim + 2, device_type=device.type
     )
 
     conv_kwargs = dict(

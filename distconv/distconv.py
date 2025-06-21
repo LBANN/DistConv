@@ -19,14 +19,7 @@ class ParallelStrategy:
     the tensor is sharded, and the device mesh configuration.
     """
 
-    def __init__(
-        self,
-        num_shards: int,
-        shard_dim: int = 2,
-        device_type: str = "cuda",
-        is_periodic: bool = False,
-        space_ndim: int = None,
-    ):
+    def __init__(self, num_shards: int, shard_dim: int = 2, device_type: str = "cuda"):
         """
         Initialize the ParallelStrategy.
 
@@ -34,19 +27,14 @@ class ParallelStrategy:
             num_shards (int): The number of shards to divide the tensor into.
             shard_dim (int, optional): The dimension along which the tensor is sharded. Defaults to 2.
             device_type (str, optional): The device type to use with DeviceMesh. Defaults to "cuda".
-            is_periodic (bool, optional): When true, adds checks to do circular padding on all boundaries.
-            space_ndim (int, optional): When periodic, need to define spatial dimension to assign
-                which boundaries are recieved by P2POp and which boundaries are on same rank.
         """
         self.num_shards = num_shards
         self.shard_dim = shard_dim
-        self.space_ndim = space_ndim
-        self.is_periodic = is_periodic
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
         self.ddp_ranks = self.world_size // self.num_shards
-
-        self.set_shard_inds()
+        self.ddp_ind = self.rank // self.num_shards
+        self.shard_ind = self.rank % self.num_shards
 
         self.device_mesh = init_device_mesh(
             device_type,
@@ -54,35 +42,8 @@ class ParallelStrategy:
             mesh_dim_names=("ddp", "dc"),
         )
 
-    def _check_gpu_map(self):
-        expected_rank = self.find_rank_from_shard(self.shard_ind)
-        assert expected_rank == self.rank, (
-            f"expected rank {expected_rank} does not match actual rank {self.rank} for shard {self.shard_ind}"
-        )
-
-    def find_rank_from_shard(self, shard_ind):
-        rank_to_ddp_index = self.rank // self.num_shards
-        expected_rank = self.shard_to_gpu_map[str(shard_ind)]
-        expected_rank += rank_to_ddp_index * self.num_shards
-        return expected_rank
-
-    def set_shard_inds(self):
-        self.nonshard_dim = []
-        if self.is_periodic:
-            for i in range(self.space_ndim):
-                if i == (self.shard_dim - 2):
-                    pass
-                else:
-                    self.nonshard_dim.append(i + 2)
-
-        self.shard_ind = self.rank % self.num_shards
-
-        self.shard_to_gpu_map = {}
-        for i in range(self.world_size):
-            mesh_str = f"{i // self.ddp_ranks}"
-            self.shard_to_gpu_map[mesh_str] = i // self.ddp_ranks
-
-        self._check_gpu_map()
+    def shard_to_rank(self, shard_ind):
+        return shard_ind % self.num_shards + self.ddp_ind * self.num_shards
 
 
 def check_is_distconv_supported(
@@ -156,7 +117,6 @@ def forward_halo_exchange(
     shard_dim = parallel_strategy.shard_dim
     num_shards = parallel_strategy.num_shards
     shard_ind = parallel_strategy.shard_ind
-    rank = dist.get_rank()
 
     # Prepare halos for sending and receiving
     inner_halo_minus = tensor.narrow(shard_dim, 0, halo_size)
@@ -166,29 +126,24 @@ def forward_halo_exchange(
 
     # Define communication operations
     ops = []
+    minus_rank = parallel_strategy.shard_to_rank(shard_ind - 1)
+    plus_rank = parallel_strategy.shard_to_rank(shard_ind + 1)
     if shard_ind > 0:
         # Receive halo from the previous rank and send their halo back
         ops += [
-            dist.P2POp(dist.irecv, halo_minus, rank - 1),
-            dist.P2POp(dist.isend, inner_halo_minus.contiguous(), rank - 1),
+            dist.P2POp(dist.irecv, halo_minus, minus_rank),
+            dist.P2POp(dist.isend, inner_halo_minus.contiguous(), minus_rank),
         ]
-    if shard_ind < (num_shards - 1):
+    if shard_ind < (num_shards - 1) or is_periodic:
         # Send halo to the next rank and receive their halo
         ops += [
-            dist.P2POp(dist.isend, inner_halo_plus.contiguous(), rank + 1),
-            dist.P2POp(dist.irecv, halo_plus, rank + 1),
-        ]
-    elif is_periodic:
-        ops += [
-            dist.P2POp(dist.isend, inner_halo_plus.contiguous(), rank - num_shards + 1),
-            dist.P2POp(dist.irecv, halo_plus, rank - num_shards + 1),
+            dist.P2POp(dist.isend, inner_halo_plus.contiguous(), plus_rank),
+            dist.P2POp(dist.irecv, halo_plus, plus_rank),
         ]
     if shard_ind == 0 and is_periodic:
         ops += [
-            dist.P2POp(dist.irecv, halo_minus, rank + num_shards - 1),
-            dist.P2POp(
-                dist.isend, inner_halo_minus.contiguous(), rank + num_shards - 1
-            ),
+            dist.P2POp(dist.irecv, halo_minus, minus_rank),
+            dist.P2POp(dist.isend, inner_halo_minus.contiguous(), minus_rank),
         ]
 
     # Execute communication operations
@@ -227,7 +182,6 @@ def backward_halo_exchange(
     shard_dim = parallel_strategy.shard_dim
     num_shards = parallel_strategy.num_shards
     shard_ind = parallel_strategy.shard_ind
-    rank = dist.get_rank()
 
     # Prepare halos for sending and receiving
     send_halo_minus = tensor.narrow(shard_dim, 0, halo_size)
@@ -237,27 +191,24 @@ def backward_halo_exchange(
 
     # Define communication operations
     ops = []
+    minus_rank = parallel_strategy.shard_to_rank(shard_ind - 1)
+    plus_rank = parallel_strategy.shard_to_rank(shard_ind + 1)
     if shard_ind > 0:
         # Receive halo from previous rank and send their halo back
         ops += [
-            dist.P2POp(dist.irecv, recv_halo_minus, rank - 1),
-            dist.P2POp(dist.isend, send_halo_minus.contiguous(), rank - 1),
+            dist.P2POp(dist.irecv, recv_halo_minus, minus_rank),
+            dist.P2POp(dist.isend, send_halo_minus.contiguous(), minus_rank),
         ]
-    if shard_ind < (num_shards - 1):
+    if shard_ind < (num_shards - 1) or is_periodic:
         # Send halo to the next rank and receive their halo
         ops += [
-            dist.P2POp(dist.isend, send_halo_plus.contiguous(), rank + 1),
-            dist.P2POp(dist.irecv, recv_halo_plus, rank + 1),
-        ]
-    elif is_periodic:
-        ops += [
-            dist.P2POp(dist.isend, send_halo_plus.contiguous(), rank - num_shards + 1),
-            dist.P2POp(dist.irecv, recv_halo_plus, rank - num_shards + 1),
+            dist.P2POp(dist.isend, send_halo_plus.contiguous(), plus_rank),
+            dist.P2POp(dist.irecv, recv_halo_plus, plus_rank),
         ]
     if shard_ind == 0 and is_periodic:
         ops += [
-            dist.P2POp(dist.irecv, recv_halo_minus, rank + num_shards - 1),
-            dist.P2POp(dist.isend, send_halo_minus.contiguous(), rank + num_shards - 1),
+            dist.P2POp(dist.irecv, recv_halo_minus, minus_rank),
+            dist.P2POp(dist.isend, send_halo_minus.contiguous(), minus_rank),
         ]
 
     # Execute communication operations

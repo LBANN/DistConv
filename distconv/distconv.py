@@ -50,6 +50,8 @@ def check_is_distconv_supported(
     stride: List[int],
     padding: List[int],
     dilation: List[int],
+    transpose: bool,
+    output_padding: List[int],
 ) -> None:
     """
     Check if the distributed convolution is supported with the given parameters.
@@ -61,31 +63,42 @@ def check_is_distconv_supported(
         stride (List[int]): The stride of the convolution.
         padding (List[int]): The padding added to the input tensor.
         dilation (List[int]): The dilation applied to the kernel.
+        transpose (bool): Is transposed convolution.
+        dilation (List[int]): The output padding for transposed convolution.
 
     Raises:
-        Exception: If dilation is not 1.
-        Exception: If input size is not divisible by stride.
-        Exception: If kernel size is odd and padding is not equivalent to "same".
-        Exception: If kernel size is even and padding is not zero.
-        Exception: If kernel size is even and stride is not divisible by kernel size.
+        Exception: If local input size is not equal to stride times output size.
+        Exception: If local output size is not equal to stride times input size for transposed convolution.
     """
     shard_dim = tensor_shard_dim - 2
     kernel_size = weight.size(tensor_shard_dim)
     if dilation[shard_dim] != 1:
         raise Exception("DistConv: dilation must be 1")
-    if tensor.size(tensor_shard_dim) % stride[shard_dim] != 0:
-        raise Exception("DistConv: input size must be divisible by stride")
-    if kernel_size % 2 == 1:
-        if (kernel_size // 2) != padding[shard_dim]:
+
+    input_size = tensor.size(tensor_shard_dim)
+
+    if not transpose:
+        output_size = (input_size + 2 * padding[shard_dim] - kernel_size) // stride[
+            shard_dim
+        ] + 1
+
+        if output_size * stride[shard_dim] != input_size:
             raise Exception(
-                f'DistConv: when kernel size is odd ({kernel_size}), padding must be equivalent to "same" but found ({padding})'
+                "DistConv: The input size along the shard dimension must equal the stride times the output size for the local tensors.\n"
+                + "This indicates incompatible kernel size, stride, and/or padding for the given input shape and parallel strategy."
             )
     else:
-        if padding[shard_dim] != 0:
-            raise Exception("DistConv: when kernel size is even, padding must be zero")
-        if stride[shard_dim] % kernel_size != 0:
+        output_size = (
+            (input_size - 1) * stride[shard_dim]
+            - 2 * padding[shard_dim]
+            + kernel_size
+            + output_padding[shard_dim]
+        )
+
+        if output_size != input_size * stride[shard_dim]:
             raise Exception(
-                "DistConv: when kernel size is even, stride must be divisble by kernel size"
+                "DistConv: The output size along the shard dimension must equal the stride times the input size for the local tensors.\n"
+                + "This indicates incompatible kernel size, stride, padding, and/or output padding for the given input shape and parallel strategy."
             )
 
 
@@ -244,22 +257,16 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
     tensor, weight, bias, stride, padding, dilation, transpose, output_padding = args[
         :8
     ]
-    padding_orig = copy(padding)
 
     # Extract the parallel strategy and shard dimension from the input tensor
     parallel_strategy = tensor._parallel_strategy
     shard_dim = parallel_strategy.shard_dim
-    shard_ind = parallel_strategy.shard_ind
-    world_size = parallel_strategy.world_size
-    kernel_size = weight.size(shard_dim)
     is_periodic = tensor._is_periodic
     if is_periodic:
         if transpose:
-            assert padding[shard_dim - 2] == dilation[shard_dim - 2] * (
-                kernel_size - 1
-            ), f"padding is incorrect"
-            padding[shard_dim - 2] = tensor._periodic_shard_padding
-            padding_orig[shard_dim - 2] = tensor._periodic_shard_padding
+            padding[shard_dim - 2] -= (
+                stride[shard_dim - 2] * tensor._periodic_shard_padding
+            )
         else:
             assert padding[shard_dim - 2] == 0, (
                 "Cannot zero-pad a tensor marked for periodic padding on the shard dimension"
@@ -271,11 +278,18 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
 
     # Check if the distributed convolution is supported with the given parameters
     check_is_distconv_supported(
-        shard_dim, torch_tensor, weight, stride, padding, dilation
+        shard_dim,
+        torch_tensor,
+        weight,
+        stride,
+        padding,
+        dilation,
+        transpose,
+        output_padding,
     )
 
     # Determine the halo size for halo exchange
-    halo_size = kernel_size // 2 if (kernel_size % 2 == 1) else 0
+    halo_size = padding[shard_dim - 2]
 
     # Perform forward halo exchange to prepare the tensor for convolution
     tensor_with_halo = forward_halo_exchange(
@@ -290,17 +304,7 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
 
     # Update the arguments with the tensor including halos and adjusted padding
     if transpose:
-        padding[shard_dim - 2] = dilation[shard_dim - 2] * (kernel_size - 1)
-        for dim_i in range(tensor.ndim - 2):
-            if dim_i + 2 == shard_dim:
-                padding[shard_dim - 2] += (kernel_size - 1 - padding_orig[dim_i]) * (
-                    stride[dim_i] - 1
-                )
-                # modify output_padding for strided transpose convolution
-                if shard_ind < world_size - 1:
-                    output_padding[dim_i] += (
-                        tensor.size(shard_dim) + 2 * padding_orig[dim_i] - kernel_size
-                    ) % stride[dim_i]
+        padding[shard_dim - 2] += stride[shard_dim - 2] * halo_size
     else:
         padding[shard_dim - 2] = 0
     args[0] = tensor_with_halo
@@ -343,26 +347,20 @@ def distconv_backward(
         transpose,
         output_padding,
     ) = args[:9]
-    padding_orig = copy(padding)
 
     # Extract the parallel strategy and shard dimension from the gradient output tensor
     parallel_strategy = grad_out_tensor._parallel_strategy
     shard_dim = parallel_strategy.shard_dim
-    shard_ind = parallel_strategy.shard_ind
-    world_size = parallel_strategy.world_size
     is_periodic = input_tensor._is_periodic
-    kernel_size = weight.size(shard_dim)
     if is_periodic:
         if transpose:
-            assert padding[shard_dim - 2] == dilation[shard_dim - 2] * (
-                kernel_size - 1
-            ), f"shard-dim padding incorrect"
-            padding[shard_dim - 2] = input_tensor._periodic_shard_padding
-            padding_orig = [input_tensor._periodic_shard_padding] * len(padding)
+            padding[shard_dim - 2] -= (
+                stride[shard_dim - 2] * input_tensor._periodic_shard_padding
+            )
         else:
-            assert (
-                padding[shard_dim - 2] == 0
-            ), "Cannot zero-pad a tensor marked for periodic padding on the shard dimension"
+            assert padding[shard_dim - 2] == 0, (
+                "Cannot zero-pad a tensor marked for periodic padding on the shard dimension"
+            )
             padding[shard_dim - 2] = input_tensor._periodic_shard_padding
 
     # Unwrap the underlying tensors from the DCTensors
@@ -371,11 +369,18 @@ def distconv_backward(
 
     # Check if the distributed convolution is supported with the given parameters
     check_is_distconv_supported(
-        shard_dim, input_torch_tensor, weight, stride, padding, dilation
+        shard_dim,
+        input_torch_tensor,
+        weight,
+        stride,
+        padding,
+        dilation,
+        transpose,
+        output_padding,
     )
 
     # Determine the halo size for halo exchange
-    halo_size = kernel_size // 2 if (kernel_size % 2 == 1) else 0
+    halo_size = padding[shard_dim - 2]
 
     # Get the input tensor including halos if available, otherwise perform forward halo exchange
     if input_tensor._tensor_with_halo is not None:
@@ -387,17 +392,7 @@ def distconv_backward(
 
     # Update the arguments with the gradient output tensor, input tensor including halos, and adjusted padding
     if transpose:
-        padding[shard_dim - 2] = dilation[shard_dim - 2] * (kernel_size - 1)
-        for dim_i in range(input_tensor.ndim - 2):
-            if dim_i + 2 == shard_dim:
-                padding[dim_i] += padding_orig[dim_i] * (stride[dim_i] - 1)
-                if shard_ind < world_size - 1:
-                    crop_amount = (
-                        input_tensor.size(shard_dim)
-                        + 2 * padding_orig[dim_i]
-                        - kernel_size
-                    ) % stride[dim_i]
-                    output_padding[dim_i] = crop_amount
+        padding[shard_dim - 2] += stride[shard_dim - 2] * halo_size
     else:
         padding[shard_dim - 2] = 0
     args[0] = grad_out_tensor

@@ -34,11 +34,13 @@ def parallel_strategy(device: torch.device):
     cleanup_parallel_strategy(ps)
 
 
-def find_padding(kernel_size):
-    if kernel_size % 2 != 0:
-        return kernel_size // 2
-    else:
-        return 0
+def find_padding(kernel_size, stride=1, explicit_padding=False):
+    ep = kernel_size // 2 if explicit_padding else 0
+    pad = (kernel_size + 2 * ep * stride - 1) // 2
+    out_pad = stride - 1
+    if explicit_padding:
+        return pad, out_pad, ep
+    return pad, out_pad
 
 
 def generate_configs():
@@ -58,7 +60,6 @@ def test_transposeconv_zerospadding(
     ndims: int,
     shard_dim: int,
     kernel_size: int,
-    padding: int,
     stride: int,
     device: torch.device,
 ):
@@ -77,20 +78,25 @@ def test_transposeconv_zerospadding(
     """
     # Set the shard dimension for the parallel strategy
     parallel_strategy.shard_dim = 2 + shard_dim
-    padding = find_padding(kernel_size)
+    padding, output_padding = find_padding(kernel_size, stride)
 
     # Initialize the input tensor and convolution layer
     shape = [1, 4] + [64] * ndims
     x = torch.randn(*shape, device=device, requires_grad=True)
     conv_class = getattr(nn, f"ConvTranspose{ndims}d")
-    conv = conv_class(4, 8, kernel_size=kernel_size, padding=padding, stride=stride).to(
-        device
-    )
+    conv = conv_class(
+        4,
+        8,
+        kernel_size=kernel_size,
+        padding=padding,
+        stride=stride,
+        output_padding=output_padding,
+    ).to(device)
 
     # Perform forward and backward pass for reference (non-distributed) convolution
     conv.zero_grad()
     ref_y = conv(x)
-    ref_y.sum().backward()
+    ref_y.square().mean().backward()
     ref_x_grad = x.grad
     ref_conv_grad = conv.weight.grad
 
@@ -99,9 +105,8 @@ def test_transposeconv_zerospadding(
     dist_conv = DistConvDDP(conv, parallel_strategy=parallel_strategy)
     dcx = DCTensor.distribute(x, parallel_strategy)
     dcy = dist_conv(dcx)
-    dcy_merge = all_gather_vlen(dcy, dim=(parallel_strategy.shard_dim))
-    dc_loss = dcy.sum()
-    dist.all_reduce(dc_loss)
+    dcy_merge = dcy.to_replicate()
+    dc_loss = dcy.to_ddp().square().mean()
     dc_loss.backward()
     x_grad = dcx.grad.to_replicate()
     dc_conv_grad = conv.weight.grad
@@ -135,22 +140,25 @@ def test_transposeconv_circularpadding(
     """
     # Set the shard dimension for the parallel strategy
     parallel_strategy.shard_dim = 2 + shard_dim
-    padding = find_padding(kernel_size)
+    padding, output_padding, explicit_padding = find_padding(
+        kernel_size, stride, explicit_padding=True
+    )
 
     # Initialize the input tensor and convolution layer
     shape = [1, 4] + [64] * ndims
     x = torch.randn(*shape, device=device, requires_grad=True)
 
-    conv_kwargs = dict(kernel_size=kernel_size, stride=stride)
+    conv_kwargs = dict(
+        kernel_size=kernel_size, stride=stride, output_padding=output_padding
+    )
 
     # set periodic padding case for reference
-    new_padding = [padding, padding] * ndims
-    x_periodic = torch.nn.functional.pad(input=x, pad=new_padding, mode="circular")
-    ref_padding = kernel_size - 1
+    explicit_padding = [explicit_padding, explicit_padding] * ndims
+    x_periodic = torch.nn.functional.pad(input=x, pad=explicit_padding, mode="circular")
 
     conv_class = getattr(nn, f"ConvTranspose{ndims}d")
     conv = (
-        conv_class(4, 8, padding=ref_padding, **conv_kwargs)
+        conv_class(4, 8, padding=padding, **conv_kwargs)
         .to(device)
         .requires_grad_(False)
     )
@@ -159,10 +167,7 @@ def test_transposeconv_circularpadding(
     # Perform forward and backward pass for reference (non-distributed) convolution
     conv.zero_grad()
     ref_y = conv(x_periodic)
-    for i in range(0, ndims):
-        crop_amount = (kernel_size - 1 - padding) * (stride - 1)
-        ref_y = ref_y.narrow(i + 2, crop_amount, ref_y.shape[i + 2] - 2 * crop_amount)
-    ref_y.sum().backward()
+    ref_y.square().mean().backward()
     ref_x_grad = x.grad
     ref_conv_grad = conv.weight.grad
 
@@ -170,15 +175,12 @@ def test_transposeconv_circularpadding(
     conv.zero_grad()
     dist_conv = DistConvDDP(conv, parallel_strategy=parallel_strategy)
     dcx = DCTensor.distribute(x, parallel_strategy)
-    dcx_periodic = torch.nn.functional.pad(input=dcx, pad=new_padding, mode="circular")
+    dcx_periodic = torch.nn.functional.pad(
+        input=dcx, pad=explicit_padding, mode="circular"
+    )
     dcy = dist_conv(dcx_periodic)
-    for i in range(0, ndims):
-        if i != shard_dim:
-            crop_amount = (kernel_size - 1 - padding) * (stride - 1)
-            dcy = dcy.narrow(i + 2, crop_amount, dcy.shape[i + 2] - 2 * crop_amount)
-    dcy_merge = all_gather_vlen(dcy.contiguous(), dim=(parallel_strategy.shard_dim))
-    dc_loss = dcy.sum()
-    dist.all_reduce(dc_loss)
+    dcy_merge = dcy.to_replicate()
+    dc_loss = dcy.to_ddp().square().mean()
     dc_loss.backward()
     x_grad = dcx.grad.to_replicate()
     dc_conv_grad = conv.weight.grad

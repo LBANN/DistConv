@@ -242,6 +242,13 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
     # Unpack the necessary arguments
     tensor, weight, bias, stride, padding, dilation = args[:6]
 
+    # when doing double-backprop (e.g. torch.autograd.grad(...).backwards())
+    # need to use core pytorch functionality
+    if weight.shape[-1] * dilation[-1] == tensor.shape[-1]:
+        args[0] = args[0].to_replicate()
+        args[1] = args[1].to_replicate()
+        return DCTensor(func(*args, **kwargs), tensor._parallel_strategy)
+
     # Extract the parallel strategy and shard dimension from the input tensor
     parallel_strategy = tensor._parallel_strategy
     shard_dim = parallel_strategy.shard_dim

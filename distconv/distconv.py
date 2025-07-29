@@ -242,17 +242,33 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
     # Unpack the necessary arguments
     tensor, weight, bias, stride, padding, dilation = args[:6]
 
-    # when doing double-backprop (e.g. torch.autograd.grad(...).backwards())
-    # need to use core pytorch functionality
-    if weight.shape[-1] * dilation[-1] == tensor.shape[-1]:
-        args[0] = args[0].to_replicate()
-        args[1] = args[1].to_replicate()
-        return DCTensor(func(*args, **kwargs), tensor._parallel_strategy)
-
     # Extract the parallel strategy and shard dimension from the input tensor
     parallel_strategy = tensor._parallel_strategy
     shard_dim = parallel_strategy.shard_dim
     is_periodic = tensor._is_periodic
+
+    # check for convNd_weight during double backprop
+    if weight.shape[shard_dim] * dilation[shard_dim - 2] == tensor.shape[shard_dim]:
+        args[0] = args[0].to_replicate()
+        args[1] = args[1].to_replicate()
+        # if is_periodic, account for shard padding
+        if is_periodic:
+            pad_map = (
+                [
+                    0,
+                ]
+                * (args[0].ndim - 2)
+                * 2
+            )
+            pad_map[2 * (shard_dim - 2)] = tensor._periodic_shard_padding
+            pad_map[2 * (shard_dim - 2) + 1] = tensor._periodic_shard_padding
+            args[0] = torch.nn.functional.pad(args[0], pad_map[::-1], mode="circular")
+
+        out = DCTensor(func(*args, **kwargs), tensor._parallel_strategy)
+        out._is_periodic = tensor._is_periodic
+        out._periodic_shard_padding = tensor._periodic_shard_padding
+        return out
+
     if is_periodic:
         assert padding[shard_dim - 2] == 0, (
             "Cannot zero-pad a tensor marked for periodic padding on the shard dimension"

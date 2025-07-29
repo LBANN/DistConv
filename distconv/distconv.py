@@ -264,10 +264,14 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
             pad_map[2 * (shard_dim - 2) + 1] = tensor._periodic_shard_padding
             args[0] = torch.nn.functional.pad(args[0], pad_map[::-1], mode="circular")
 
-        out = DCTensor(func(*args, **kwargs), tensor._parallel_strategy)
-        out._is_periodic = tensor._is_periodic
-        out._periodic_shard_padding = tensor._periodic_shard_padding
-        return out
+        # Note: DDP already scales the gradients by the world size
+        grad_reduction_factor = parallel_strategy.ddp_ranks
+        grad_reduction_factor = dist.get_world_size() / grad_reduction_factor
+
+        grad_w = DCTensor(func(*args, **kwargs), tensor._parallel_strategy)
+        grad_w._is_periodic = tensor._is_periodic
+        grad_w._periodic_shard_padding = tensor._periodic_shard_padding
+        return grad_w / grad_reduction_factor
 
     if is_periodic:
         assert padding[shard_dim - 2] == 0, (

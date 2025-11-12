@@ -30,6 +30,7 @@ class ParallelStrategy:
         """
         if type(num_shards) == int:
             num_shards = (num_shards,)
+        if type(shard_dim) == int:
             shard_dim = (shard_dim,)
         self.total_num_shards = prod(num_shards)
         self.num_shards = num_shards
@@ -42,8 +43,7 @@ class ParallelStrategy:
         # make lookup table of GPU->shard_ind
         self.shard_ind = [None] * len(num_shards)
         mesh = meshgrid(
-            *[arange(0, num_shards_i) for num_shards_i in num_shards],
-            indexing="ij"
+            *[arange(0, num_shards_i) for num_shards_i in num_shards], indexing="ij"
         )
         for i, mesh_i in enumerate(mesh):
             self.shard_ind[i] = int(mesh_i.ravel()[self.rank % self.total_num_shards])
@@ -64,10 +64,12 @@ class ParallelStrategy:
         assert len(shard_ind) == len(self.num_shards)
         rank = 0
         stride = 1
-        for shard_ind_dim_i, num_shards_dim_i in zip(reversed(shard_ind), reversed(self.num_shards)):
+        for shard_ind_dim_i, num_shards_dim_i in zip(
+            reversed(shard_ind), reversed(self.num_shards)
+        ):
             # modify shard ind for periodicity
             if shard_ind_dim_i < 0:
-                shard_ind_dim_i = num_shards_dim_i-1
+                shard_ind_dim_i = num_shards_dim_i - 1
             if shard_ind_dim_i == num_shards_dim_i:
                 shard_ind_dim_i = 0
             rank += shard_ind_dim_i * stride
@@ -291,10 +293,10 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
     shard_dim = parallel_strategy.shard_dim
     is_periodic = tensor._is_periodic
     if is_periodic:
-        for i, shard_dim_i in enumerate(shard_dim):    
-            assert padding[shard_dim_i - 2] == 0, (
-                "Cannot zero-pad a tensor marked for periodic padding on the shard dimension"
-            )
+        for i, shard_dim_i in enumerate(shard_dim):
+            assert (
+                padding[shard_dim_i - 2] == 0
+            ), "Cannot zero-pad a tensor marked for periodic padding on the shard dimension"
             padding[shard_dim_i - 2] = tensor._periodic_shard_padding[i]
 
     # Unwrap the underlying tensor from the DCTensor
@@ -318,24 +320,23 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
 
         # Save the tensor with its halo for the backward pass.
         tensor._tensor_with_halo = tensor_with_halo
-        tensor._tensor = tensor_with_halo.narrow(
-            shard_dim_i, halo_size, tensor.size(shard_dim_i)
-        )
 
         # Update the arguments with the tensor including halos and adjusted padding
         args[0] = tensor_with_halo
         padding[shard_dim_i - 2] = 0
         args[4] = padding
 
+    tensor._tensor = tensor_with_halo
+    for i, shard_dim_i in enumerate(shard_dim):
+        tensor._tensor = tensor._tensor.narrow(
+            shard_dim_i, halo_size, tensor.size(shard_dim_i)
+        )
+
     # Perform the convolution operation
     out_tensor = func(*args, **kwargs)
 
     # Wrap the output tensor in a DCTensor and return it
     return DCTensor(out_tensor, parallel_strategy)
-
-
-def shard_ind_to_str(shard_ind_list):
-    return "-".join([str(s) for s in shard_ind_list])
 
 
 def distconv_backward(
@@ -366,9 +367,9 @@ def distconv_backward(
     is_periodic = input_tensor._is_periodic
     if is_periodic:
         for i, shard_dim_i in enumerate(shard_dim):
-            assert padding[shard_dim_i - 2] == 0, (
-                "Cannot zero-pad a tensor marked for periodic padding on the shard dimension"
-            )
+            assert (
+                padding[shard_dim_i - 2] == 0
+            ), "Cannot zero-pad a tensor marked for periodic padding on the shard dimension"
             padding[shard_dim_i - 2] = input_tensor._periodic_shard_padding[i]
 
     # Unwrap the underlying tensors from the DCTensors
@@ -390,10 +391,11 @@ def distconv_backward(
     if input_tensor._tensor_with_halo is not None:
         input_tensor_with_halo = input_tensor._tensor_with_halo
     else:
-        # TODO: check this
-        input_tensor_with_halo = forward_halo_exchange(
-            input_torch_tensor, halo_size, parallel_strategy, is_periodic
-        )
+        input_tensor_with_halo = input_torch_tensor
+        for i, shard_dim_i in enumerate(shard_dim):
+            input_tensor_with_halo = forward_halo_exchange(
+                input_tensor_with_halo, halo_size, parallel_strategy, i, is_periodic
+            )
 
     # Update the arguments with the gradient output tensor, input tensor including halos, and adjusted padding
     args[0] = grad_out_tensor
@@ -535,7 +537,9 @@ class DCTensor(torch.Tensor):
             _ToTensor.apply(self),
             device_mesh=device_mesh,
             placements=placements,
-        ).redistribute(device_mesh=device_mesh, placements=[Replicate()])
+        ).redistribute(
+            device_mesh=device_mesh, placements=[Replicate()] * device_mesh.ndim
+        )
         return dtensor.to_local()
 
     @classmethod
@@ -587,8 +591,12 @@ class DCTensor(torch.Tensor):
         parallel_strategy = input_tensor._parallel_strategy
         shard_dim = parallel_strategy.shard_dim
         pad_list = list(pad)
-        shard_padding = [0,]*len(shard_dim)
-        is_periodic = [False,]*len(shard_dim)
+        shard_padding = [
+            0,
+        ] * len(shard_dim)
+        is_periodic = [
+            False,
+        ] * len(shard_dim)
 
         # Calculate padding indices for shard dimension
         ndim = input_tensor.dim()
@@ -601,9 +609,9 @@ class DCTensor(torch.Tensor):
                 shard_pad_minus = pad_list[shard_pad_start_idx]
                 shard_pad_plus = pad_list[shard_pad_end_idx]
 
-                assert shard_pad_minus == shard_pad_plus, (
-                    "Periodic padding must be symmetric on sharded dimension"
-                )
+                assert (
+                    shard_pad_minus == shard_pad_plus
+                ), "Periodic padding must be symmetric on sharded dimension"
                 shard_padding[i] = shard_pad_minus
                 is_periodic[i] = True
 
@@ -650,9 +658,9 @@ class DCTensor(torch.Tensor):
 
         def unwrap(t):
             if isinstance(t, DCTensor):
-                assert self._parallel_strategy == t._parallel_strategy, (
-                    "Parallel strategy mismatch"
-                )
+                assert (
+                    self._parallel_strategy == t._parallel_strategy
+                ), "Parallel strategy mismatch"
                 return t._tensor
             else:
                 return t

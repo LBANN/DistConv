@@ -28,28 +28,25 @@ class ParallelStrategy:
             shard_dim (list, optional): The dimensions along which the tensor is sharded. Defaults to 2.
             device_type (str, optional): The device type to use with DeviceMesh. Defaults to "cuda".
         """
-        if type(num_shards) == int:
-            num_shards = (num_shards,)
-        if type(shard_dim) == int:
-            shard_dim = (shard_dim,)
-        self.total_num_shards = prod(num_shards)
         self.num_shards = num_shards
         self.shard_dim = shard_dim
+        self.total_num_shards = prod(self.num_shards)
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
         self.ddp_ind = self.rank // self.total_num_shards
 
         self.ddp_ranks = self.world_size // self.total_num_shards
         # make lookup table of GPU->shard_ind
-        self.shard_ind = [None] * len(num_shards)
+        self.shard_ind = [None] * len(self.num_shards)
         mesh = meshgrid(
-            *[arange(0, num_shards_i) for num_shards_i in num_shards], indexing="ij"
+            *[arange(0, num_shards_i) for num_shards_i in self.num_shards],
+            indexing="ij",
         )
         for i, mesh_i in enumerate(mesh):
             self.shard_ind[i] = int(mesh_i.ravel()[self.rank % self.total_num_shards])
 
-        self.distconv_dim_names = tuple([f"dc{i}" for i in range(len(shard_dim))])
-        mesh_shape = (self.ddp_ranks,) + num_shards
+        self.distconv_dim_names = tuple([f"dc{i}" for i in range(len(self.shard_dim))])
+        mesh_shape = (self.ddp_ranks,) + self.num_shards
         mesh_dim_names = ("ddp",) + self.distconv_dim_names
 
         self.device_mesh = init_device_mesh(
@@ -75,6 +72,35 @@ class ParallelStrategy:
             rank += shard_ind_dim_i * stride
             stride *= num_shards_dim_i
         return rank + self.ddp_ind * self.total_num_shards
+
+    @property
+    def num_shards(self):
+        return self._num_shards
+
+    @num_shards.setter
+    def num_shards(self, value):
+        if type(value) == int:
+            self._num_shards = (value,)
+        else:
+            if type(value) in [tuple, list]:
+                self._num_shards = value
+            else:
+                raise TypeError(f"Unexpected num_shards type {type(value)}")
+        self.total_num_shards = prod(self._num_shards)
+
+    @property
+    def shard_dim(self):
+        return self._shard_dim
+
+    @shard_dim.setter
+    def shard_dim(self, value):
+        if type(value) == int:
+            self._shard_dim = (value,)
+        else:
+            if type(value) in [tuple, list]:
+                self._shard_dim = value
+            else:
+                raise TypeError(f"Unexpected shard_dim type {type(value)}")
 
 
 def check_is_distconv_supported(

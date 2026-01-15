@@ -8,6 +8,17 @@ from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tenso
 from torch.utils._pytree import tree_map
 
 
+def get_memory_format(tensor: torch.Tensor) -> torch.memory_format:
+    """Detect the memory format of a tensor."""
+    if tensor.dim() == 4 and tensor.is_contiguous(memory_format=torch.channels_last):
+        return torch.channels_last
+    elif tensor.dim() == 5 and tensor.is_contiguous(
+        memory_format=torch.channels_last_3d
+    ):
+        return torch.channels_last_3d
+    return torch.contiguous_format
+
+
 class ParallelStrategy:
     """
     ParallelStrategy defines the strategy for distributing tensors across multiple devices
@@ -109,6 +120,9 @@ def forward_halo_exchange(
     if halo_size == 0:
         return tensor
 
+    # Detect memory format to preserve throughout operations
+    memory_format = get_memory_format(tensor)
+
     # Extract parallel strategy parameters
     shard_dim = parallel_strategy.shard_dim
     num_shards = parallel_strategy.num_shards
@@ -128,18 +142,30 @@ def forward_halo_exchange(
         # Receive halo from the previous rank and send their halo back
         ops += [
             dist.P2POp(dist.irecv, halo_minus, minus_rank),
-            dist.P2POp(dist.isend, inner_halo_minus.contiguous(), minus_rank),
+            dist.P2POp(
+                dist.isend,
+                inner_halo_minus.contiguous(memory_format=memory_format),
+                minus_rank,
+            ),
         ]
     if shard_ind < (num_shards - 1) or is_periodic:
         # Send halo to the next rank and receive their halo
         ops += [
-            dist.P2POp(dist.isend, inner_halo_plus.contiguous(), plus_rank),
+            dist.P2POp(
+                dist.isend,
+                inner_halo_plus.contiguous(memory_format=memory_format),
+                plus_rank,
+            ),
             dist.P2POp(dist.irecv, halo_plus, plus_rank),
         ]
     if shard_ind == 0 and is_periodic:
         ops += [
             dist.P2POp(dist.irecv, halo_minus, minus_rank),
-            dist.P2POp(dist.isend, inner_halo_minus.contiguous(), minus_rank),
+            dist.P2POp(
+                dist.isend,
+                inner_halo_minus.contiguous(memory_format=memory_format),
+                minus_rank,
+            ),
         ]
 
     # Execute communication operations
@@ -175,6 +201,9 @@ def backward_halo_exchange(
     if halo_size == 0:
         return tensor
 
+    # Detect memory format to preserve throughout operations
+    memory_format = get_memory_format(tensor)
+
     # Extract parallel strategy parameters
     shard_dim = parallel_strategy.shard_dim
     num_shards = parallel_strategy.num_shards
@@ -194,18 +223,30 @@ def backward_halo_exchange(
         # Receive halo from previous rank and send their halo back
         ops += [
             dist.P2POp(dist.irecv, recv_halo_minus, minus_rank),
-            dist.P2POp(dist.isend, send_halo_minus.contiguous(), minus_rank),
+            dist.P2POp(
+                dist.isend,
+                send_halo_minus.contiguous(memory_format=memory_format),
+                minus_rank,
+            ),
         ]
     if shard_ind < (num_shards - 1) or is_periodic:
         # Send halo to the next rank and receive their halo
         ops += [
-            dist.P2POp(dist.isend, send_halo_plus.contiguous(), plus_rank),
+            dist.P2POp(
+                dist.isend,
+                send_halo_plus.contiguous(memory_format=memory_format),
+                plus_rank,
+            ),
             dist.P2POp(dist.irecv, recv_halo_plus, plus_rank),
         ]
     if shard_ind == 0 and is_periodic:
         ops += [
             dist.P2POp(dist.irecv, recv_halo_minus, minus_rank),
-            dist.P2POp(dist.isend, send_halo_minus.contiguous(), minus_rank),
+            dist.P2POp(
+                dist.isend,
+                send_halo_minus.contiguous(memory_format=memory_format),
+                minus_rank,
+            ),
         ]
 
     # Execute communication operations
@@ -436,12 +477,18 @@ class DCTensor(torch.Tensor):
         Returns:
             DCTensor: A new instance of DCTensor with the tensor sharded according to the parallel strategy.
         """
+        # Preserve memory format through distribution
+        memory_format = get_memory_format(tensor)
         dtensor = distribute_tensor(
             tensor,
             device_mesh=parallel_strategy.device_mesh["dc"],
             placements=[Shard(parallel_strategy.shard_dim)],
         )
-        return cls(dtensor.to_local(), parallel_strategy)
+        local_tensor = dtensor.to_local()
+        # DTensor may not preserve memory format, so convert back if needed
+        if memory_format != torch.contiguous_format:
+            local_tensor = local_tensor.contiguous(memory_format=memory_format)
+        return cls(local_tensor, parallel_strategy)
 
     def to_ddp(self) -> torch.Tensor:
         """
@@ -450,6 +497,8 @@ class DCTensor(torch.Tensor):
         Returns:
             torch.Tensor: The tensor resharded to the batch dimension.
         """
+        # Preserve memory format through redistribution
+        memory_format = get_memory_format(self._tensor)
         device_mesh = self._parallel_strategy.device_mesh["dc"]
         shard_dim = self._parallel_strategy.shard_dim
         dtensor = DTensor.from_local(
@@ -457,7 +506,11 @@ class DCTensor(torch.Tensor):
             device_mesh=device_mesh,
             placements=[Shard(shard_dim)],
         ).redistribute(device_mesh=device_mesh, placements=[Shard(0)])
-        return dtensor.to_local()
+        local_tensor = dtensor.to_local()
+        # DTensor may not preserve memory format, so convert back if needed
+        if memory_format != torch.contiguous_format:
+            local_tensor = local_tensor.contiguous(memory_format=memory_format)
+        return local_tensor
 
     def to_replicate(self) -> torch.Tensor:
         """
@@ -466,6 +519,8 @@ class DCTensor(torch.Tensor):
         Returns:
             torch.Tensor: The full tensor.
         """
+        # Preserve memory format through redistribution
+        memory_format = get_memory_format(self._tensor)
         device_mesh = self._parallel_strategy.device_mesh["dc"]
         shard_dim = self._parallel_strategy.shard_dim
         dtensor = DTensor.from_local(
@@ -473,7 +528,11 @@ class DCTensor(torch.Tensor):
             device_mesh=device_mesh,
             placements=[Shard(shard_dim)],
         ).redistribute(device_mesh=device_mesh, placements=[Replicate()])
-        return dtensor.to_local()
+        local_tensor = dtensor.to_local()
+        # DTensor may not preserve memory format, so convert back if needed
+        if memory_format != torch.contiguous_format:
+            local_tensor = local_tensor.contiguous(memory_format=memory_format)
+        return local_tensor
 
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):

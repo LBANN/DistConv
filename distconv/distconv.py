@@ -143,9 +143,10 @@ def forward_halo_exchange(
         ]
 
     # Execute communication operations
-    reqs = dist.batch_isend_irecv(ops)
-    for req in reqs:
-        req.wait()
+    if ops:
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
 
     # Concatenate received halos with the original tensor
     tensor_with_halo = torch.cat([halo_minus, tensor, halo_plus], dim=shard_dim)
@@ -208,9 +209,10 @@ def backward_halo_exchange(
         ]
 
     # Execute communication operations
-    reqs = dist.batch_isend_irecv(ops)
-    for req in reqs:
-        req.wait()
+    if ops:
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
 
     # Accumulate received halos into the inner tensor
     inner_tensor = tensor.narrow(

@@ -173,3 +173,268 @@ def test_3d_splitting(
     assert fp32_allclose(ref_y, ddpy)
     assert fp32_allclose(ref_x_grad, x_grad)
     assert fp32_allclose(ref_conv_grad, dc_conv_grad)
+
+
+@pytest.mark.parametrize(
+    "kernel_sizes,padding",
+    [
+        ((3, 5), (1, 2)),  # Different halo sizes: 1 vs 2
+        ((5, 3), (2, 1)),  # Reversed order
+        ((1, 3), (0, 1)),  # One with no halo, one with halo
+        ((3, 1), (1, 0)),  # Reversed
+    ],
+)
+def test_2d_splitting_nonuniform_kernel(
+    parallel_strategy_2d: ParallelStrategy,
+    kernel_sizes: tuple,
+    padding: tuple,
+    device: torch.device,
+):
+    """
+    Test 2D splitting with non-uniform kernel sizes.
+
+    Verifies that halo exchange correctly handles different halo sizes per dimension
+    when kernel sizes differ (e.g., 3x5 kernel requires halo_size=1 for dim 0 and
+    halo_size=2 for dim 1).
+    """
+    parallel_strategy = parallel_strategy_2d
+    parallel_strategy.shard_dim = (2, 3)
+
+    # Initialize input tensor - large enough to be divisible by stride and shards
+    shape = [1, 4, 64, 64]
+    x = torch.randn(*shape, device=device, requires_grad=True)
+
+    # Create conv with non-uniform kernel sizes
+    conv = nn.Conv2d(
+        4,
+        8,
+        kernel_size=kernel_sizes,
+        padding=padding,
+        stride=1,
+        padding_mode="zeros",
+    ).to(device)
+
+    # Reference (non-distributed) forward and backward
+    conv.zero_grad()
+    ref_y = conv(x)
+    ref_y.square().mean().backward()
+    ref_x_grad = x.grad.clone()
+    ref_conv_grad = conv.weight.grad.clone()
+
+    # Distributed forward and backward
+    x.grad = None
+    conv.zero_grad()
+    ddp_conv = DistConvDDP(conv, parallel_strategy=parallel_strategy)
+    dcx = DCTensor.distribute(x, parallel_strategy)
+    dcy = ddp_conv(dcx)
+    ddpy = dcy.to_replicate()
+    ddpy.square().mean().backward()
+    x_grad = dcx.grad.to_replicate()
+    dc_conv_grad = conv.weight.grad
+
+    # Validate results
+    assert fp32_allclose(ref_y, ddpy), "Forward pass mismatch with non-uniform kernel"
+    assert fp32_allclose(ref_x_grad, x_grad), (
+        "Input gradient mismatch with non-uniform kernel"
+    )
+    assert fp32_allclose(ref_conv_grad, dc_conv_grad), (
+        "Weight gradient mismatch with non-uniform kernel"
+    )
+
+
+@pytest.mark.parametrize(
+    "kernel_sizes",
+    [
+        (3, 5),
+        (5, 3),
+    ],
+)
+def test_2d_splitting_nonuniform_kernel_circular(
+    parallel_strategy_2d: ParallelStrategy,
+    kernel_sizes: tuple,
+    device: torch.device,
+):
+    """
+    Test 2D splitting with non-uniform kernels and circular padding.
+
+    Verifies that non-uniform kernel sizes work correctly with periodic boundary
+    conditions, where each dimension has its own halo size and periodicity flag.
+    """
+    parallel_strategy = parallel_strategy_2d
+    parallel_strategy.shard_dim = (2, 3)
+
+    # Padding for "same" convolution with odd kernels
+    padding = (kernel_sizes[0] // 2, kernel_sizes[1] // 2)
+
+    # Initialize input tensor
+    shape = [1, 4, 64, 64]
+    x = torch.randn(*shape, device=device, requires_grad=True)
+
+    # Create conv with non-uniform kernel sizes and circular padding
+    conv = nn.Conv2d(
+        4,
+        8,
+        kernel_size=kernel_sizes,
+        padding=padding,
+        stride=1,
+        padding_mode="circular",
+    ).to(device)
+
+    # Reference (non-distributed) forward and backward
+    conv.zero_grad()
+    ref_y = conv(x)
+    ref_y.square().mean().backward()
+    ref_x_grad = x.grad.clone()
+    ref_conv_grad = conv.weight.grad.clone()
+
+    # Distributed forward and backward
+    x.grad = None
+    conv.zero_grad()
+    ddp_conv = DistConvDDP(conv, parallel_strategy=parallel_strategy)
+    dcx = DCTensor.distribute(x, parallel_strategy)
+    dcy = ddp_conv(dcx)
+    ddpy = dcy.to_replicate()
+    ddpy.square().mean().backward()
+    x_grad = dcx.grad.to_replicate()
+    dc_conv_grad = conv.weight.grad
+
+    # Validate results
+    assert fp32_allclose(ref_y, ddpy), (
+        "Forward pass mismatch with non-uniform kernel + circular padding"
+    )
+    assert fp32_allclose(ref_x_grad, x_grad), (
+        "Input gradient mismatch with non-uniform kernel + circular padding"
+    )
+    assert fp32_allclose(ref_conv_grad, dc_conv_grad), (
+        "Weight gradient mismatch with non-uniform kernel + circular padding"
+    )
+
+
+@pytest.mark.skipif(int(os.environ["WORLD_SIZE"]) < 8, reason="requires 8 ranks")
+@pytest.mark.parametrize(
+    "kernel_sizes,padding",
+    [
+        ((3, 5, 7), (1, 2, 3)),  # All different halo sizes
+        ((1, 3, 5), (0, 1, 2)),  # Progressive sizes
+        ((7, 3, 1), (3, 1, 0)),  # Decreasing sizes
+    ],
+)
+def test_3d_splitting_nonuniform_kernel(
+    parallel_strategy_3d: ParallelStrategy,
+    kernel_sizes: tuple,
+    padding: tuple,
+    device: torch.device,
+):
+    """
+    Test 3D splitting with non-uniform kernel sizes.
+
+    Verifies that halo exchange correctly handles three different halo sizes
+    when splitting across all three spatial dimensions with varying kernel sizes.
+    """
+    parallel_strategy = parallel_strategy_3d
+
+    # Initialize input tensor - 3D spatial dimensions
+    shape = [1, 4, 32, 32, 32]
+    x = torch.randn(*shape, device=device, requires_grad=True)
+
+    # Create Conv3d with non-uniform kernel sizes
+    conv = nn.Conv3d(
+        4,
+        8,
+        kernel_size=kernel_sizes,
+        padding=padding,
+        stride=1,
+        padding_mode="zeros",
+    ).to(device)
+
+    # Reference (non-distributed) forward and backward
+    conv.zero_grad()
+    ref_y = conv(x)
+    ref_y.square().mean().backward()
+    ref_x_grad = x.grad.clone()
+    ref_conv_grad = conv.weight.grad.clone()
+
+    # Distributed forward and backward
+    x.grad = None
+    conv.zero_grad()
+    ddp_conv = DistConvDDP(conv, parallel_strategy=parallel_strategy)
+    dcx = DCTensor.distribute(x, parallel_strategy)
+    dcy = ddp_conv(dcx)
+    ddpy = dcy.to_replicate()
+    ddpy.square().mean().backward()
+    x_grad = dcx.grad.to_replicate()
+    dc_conv_grad = conv.weight.grad
+
+    # Validate results
+    assert fp32_allclose(ref_y, ddpy), (
+        "Forward pass mismatch with 3D non-uniform kernel"
+    )
+    assert fp32_allclose(ref_x_grad, x_grad), (
+        "Input gradient mismatch with 3D non-uniform kernel"
+    )
+    assert fp32_allclose(ref_conv_grad, dc_conv_grad), (
+        "Weight gradient mismatch with 3D non-uniform kernel"
+    )
+
+
+@pytest.mark.parametrize("stride", [1, 2])
+def test_2d_splitting_nonuniform_kernel_with_stride(
+    parallel_strategy_2d: ParallelStrategy,
+    stride: int,
+    device: torch.device,
+):
+    """
+    Test 2D splitting with non-uniform kernels and strided convolution.
+
+    This tests the interaction between non-uniform kernels and stride, which
+    affects how the output tensor size is computed and how halo data is used.
+    """
+    parallel_strategy = parallel_strategy_2d
+    parallel_strategy.shard_dim = (2, 3)
+
+    # Non-uniform kernel with different halo sizes
+    kernel_sizes = (3, 5)
+    padding = (1, 2)
+
+    # Initialize input tensor - must be divisible by stride and shards
+    shape = [1, 4, 64, 64]
+    x = torch.randn(*shape, device=device, requires_grad=True)
+
+    # Create conv with non-uniform kernel sizes
+    conv = nn.Conv2d(
+        4,
+        8,
+        kernel_size=kernel_sizes,
+        padding=padding,
+        stride=stride,
+        padding_mode="zeros",
+    ).to(device)
+
+    # Reference (non-distributed) forward and backward
+    conv.zero_grad()
+    ref_y = conv(x)
+    ref_y.square().mean().backward()
+    ref_x_grad = x.grad.clone()
+    ref_conv_grad = conv.weight.grad.clone()
+
+    # Distributed forward and backward
+    x.grad = None
+    conv.zero_grad()
+    ddp_conv = DistConvDDP(conv, parallel_strategy=parallel_strategy)
+    dcx = DCTensor.distribute(x, parallel_strategy)
+    dcy = ddp_conv(dcx)
+    ddpy = dcy.to_replicate()
+    ddpy.square().mean().backward()
+    x_grad = dcx.grad.to_replicate()
+    dc_conv_grad = conv.weight.grad
+
+    # Validate results
+    assert fp32_allclose(ref_y, ddpy), (
+        "Forward pass mismatch with non-uniform kernel + stride"
+    )
+    assert fp32_allclose(ref_x_grad, x_grad), (
+        "Input gradient mismatch with non-uniform kernel + stride"
+    )
+    assert fp32_allclose(ref_conv_grad, dc_conv_grad), (
+        "Weight gradient mismatch with non-uniform kernel + stride"
+    )

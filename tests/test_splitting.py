@@ -1,7 +1,6 @@
 import os
 import pytest
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from utils import cleanup_parallel_strategy, fp32_allclose
 

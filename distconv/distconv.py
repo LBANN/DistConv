@@ -248,6 +248,33 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
     parallel_strategy = tensor._parallel_strategy
     shard_dim = parallel_strategy.shard_dim
     is_periodic = tensor._is_periodic
+
+    # check for convNd_weight during double backprop
+    if weight.shape[shard_dim] * dilation[shard_dim - 2] == tensor.shape[shard_dim]:
+        args[0] = args[0].to_replicate()
+        args[1] = args[1].to_replicate()
+        # if is_periodic, account for shard padding
+        if is_periodic:
+            pad_map = (
+                [
+                    0,
+                ]
+                * (args[0].ndim - 2)
+                * 2
+            )
+            pad_map[2 * (shard_dim - 2)] = tensor._periodic_shard_padding
+            pad_map[2 * (shard_dim - 2) + 1] = tensor._periodic_shard_padding
+            args[0] = torch.nn.functional.pad(args[0], pad_map[::-1], mode="circular")
+
+        # Note: DDP already scales the gradients by the world size
+        grad_reduction_factor = parallel_strategy.ddp_ranks
+        grad_reduction_factor = dist.get_world_size() / grad_reduction_factor
+
+        grad_w = DCTensor(func(*args, **kwargs), tensor._parallel_strategy)
+        grad_w._is_periodic = tensor._is_periodic
+        grad_w._periodic_shard_padding = tensor._periodic_shard_padding
+        return grad_w / grad_reduction_factor
+
     if is_periodic:
         assert padding[shard_dim - 2] == 0, (
             "Cannot zero-pad a tensor marked for periodic padding on the shard dimension"
@@ -286,7 +313,10 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
     out_tensor = func(*args, **kwargs)
 
     # Wrap the output tensor in a DCTensor and return it
-    return DCTensor(out_tensor, parallel_strategy)
+    out_tensor = DCTensor(out_tensor, parallel_strategy)
+    out_tensor._is_periodic = tensor._is_periodic
+    out_tensor._periodic_shard_padding = tensor._periodic_shard_padding
+    return out_tensor
 
 
 def distconv_backward(
@@ -359,6 +389,8 @@ def distconv_backward(
 
         # Wrap the gradient input tensor in a DCTensor
         grad_in_tensor = DCTensor(grad_in_tensor, parallel_strategy)
+        grad_in_tensor._is_periodic = input_tensor._is_periodic
+        grad_in_tensor._periodic_shard_padding = input_tensor._periodic_shard_padding
 
     # Return the gradients with respect to the input tensor, weight, and bias
     return grad_in_tensor, grad_weight, grad_bias
@@ -547,6 +579,8 @@ class DCTensor(torch.Tensor):
             shard_padding = 0
 
         # Call F.pad with modified padding (shard dim padding disabled)
+        input_tensor._is_periodic = shard_padding > 0
+        input_tensor._periodic_shard_padding = shard_padding
         new_args = (_ToTensor.apply(input_tensor), tuple(pad_list)) + args[2:]
         partial_padded_tensor = func(*new_args, **kwargs)
 
@@ -591,7 +625,10 @@ class DCTensor(torch.Tensor):
 
         def wrap(t):
             if isinstance(t, torch.Tensor) and not isinstance(t, DCTensor):
-                return DCTensor(t, self._parallel_strategy)
+                out = DCTensor(t, self._parallel_strategy)
+                out._is_periodic = self._is_periodic
+                out._periodic_shard_padding = self._periodic_shard_padding
+                return out
             else:
                 return t
 
@@ -621,10 +658,13 @@ class _FromTensor(Function):
 
     @staticmethod
     def forward(ctx, tensor: torch.Tensor, parallel_strategy: ParallelStrategy):
+        ctx.parallel_strategy = parallel_strategy
         return DCTensor(tensor, parallel_strategy)
 
     @staticmethod
     def backward(ctx, grad: DCTensor):
+        if type(grad) != DCTensor:
+            grad = DCTensor.from_shard(grad, ctx.parallel_strategy)
         return _ToTensor.apply(grad), None
 
 
@@ -642,8 +682,13 @@ class _ToTensor(Function):
     @staticmethod
     def forward(ctx, dc_tensor: DCTensor):
         ctx.parallel_strategy = dc_tensor._parallel_strategy
+        ctx._is_periodic = dc_tensor._is_periodic
+        ctx._periodic_shard_padding = dc_tensor._periodic_shard_padding
         return dc_tensor._tensor
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
-        return _FromTensor.apply(grad, ctx.parallel_strategy)
+        result = _FromTensor.apply(grad, ctx.parallel_strategy)
+        result._is_periodic = ctx._is_periodic
+        result._periodic_shard_padding = ctx._periodic_shard_padding
+        return result

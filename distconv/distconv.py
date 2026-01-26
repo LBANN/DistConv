@@ -116,6 +116,14 @@ class ParallelStrategy:
             self._shard_dim = tuple(value)
         else:
             raise TypeError(f"Unexpected shard_dim type {type(value)}")
+        # Validate each shard dimension is >= 2 (spatial dimensions only)
+        for dim in self._shard_dim:
+            if dim < 2:
+                raise ValueError(
+                    f"Invalid shard_dim value: {dim}. "
+                    f"DistConv only supports sharding spatial dimensions (dim >= 2). "
+                    f"Cannot shard batch dimension (0) or channel dimension (1)."
+                )
         # Validate length matches num_shards if already set
         if hasattr(self, "_num_shards") and len(self._shard_dim) != len(
             self._num_shards

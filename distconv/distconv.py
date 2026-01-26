@@ -62,7 +62,7 @@ class ParallelStrategy:
             self.shard_ind.append(linear_idx // stride)
             linear_idx %= stride
 
-        self.distconv_dim_names = tuple([f"dc{i}" for i in range(len(self.shard_dim))])
+        self.distconv_dim_names = tuple([f"dc{i}" for i in self.shard_dim])
         mesh_shape = (self.ddp_ranks,) + self.num_shards
         mesh_dim_names = ("ddp",) + self.distconv_dim_names
 

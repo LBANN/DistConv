@@ -10,8 +10,14 @@ from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tenso
 from torch.utils._pytree import tree_map
 
 
-def get_memory_format(tensor: torch.Tensor) -> torch.memory_format:
-    """Detect the memory format of a tensor."""
+def infer_contiguous_format(tensor: torch.Tensor) -> torch.memory_format:
+    """
+    Infer the contiguous memory format for a tensor.
+
+    Returns channels_last or channels_last_3d if the tensor is already in that format but otherwise
+    defaults to contiguous_format. This is used for preserving the memory format through various
+    communication operations (halo exchange and DCTensor redistribution).
+    """
     if tensor.dim() == 4 and tensor.is_contiguous(memory_format=torch.channels_last):
         return torch.channels_last
     elif tensor.dim() == 5 and tensor.is_contiguous(
@@ -193,7 +199,7 @@ def forward_halo_exchange(
         return tensor
 
     # Detect memory format to preserve throughout operations
-    memory_format = get_memory_format(tensor)
+    memory_format = infer_contiguous_format(tensor)
 
     # Extract parallel strategy parameters
     shard_dim = parallel_strategy.shard_dim[dim_index]
@@ -283,7 +289,7 @@ def backward_halo_exchange(
         return tensor
 
     # Detect memory format to preserve throughout operations
-    memory_format = get_memory_format(tensor)
+    memory_format = infer_contiguous_format(tensor)
 
     # Extract parallel strategy parameters
     shard_dim = parallel_strategy.shard_dim[dim_index]
@@ -584,7 +590,7 @@ class DCTensor(torch.Tensor):
             DCTensor: A new instance of DCTensor with the tensor sharded according to the parallel strategy.
         """
         # Preserve memory format through distribution
-        memory_format = get_memory_format(tensor)
+        memory_format = infer_contiguous_format(tensor)
         placements = [Shard(i) for i in parallel_strategy.shard_dim]
         device_mesh = parallel_strategy.device_mesh[
             parallel_strategy.distconv_dim_names
@@ -608,7 +614,7 @@ class DCTensor(torch.Tensor):
             torch.Tensor: The tensor resharded to the batch dimension.
         """
         # Preserve memory format through redistribution
-        memory_format = get_memory_format(self._tensor)
+        memory_format = infer_contiguous_format(self._tensor)
         device_mesh = self._parallel_strategy.device_mesh[
             self._parallel_strategy.distconv_dim_names
         ]
@@ -634,7 +640,7 @@ class DCTensor(torch.Tensor):
             torch.Tensor: The full tensor.
         """
         # Preserve memory format through redistribution
-        memory_format = get_memory_format(self._tensor)
+        memory_format = infer_contiguous_format(self._tensor)
         device_mesh = self._parallel_strategy.device_mesh[
             self._parallel_strategy.distconv_dim_names
         ]

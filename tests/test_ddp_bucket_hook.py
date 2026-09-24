@@ -27,6 +27,8 @@ class TestAccumulation:
         ps = ParallelStrategy(num_shards=2, device_type=device.type)
         yield ps
         cleanup_parallel_strategy(ps)
+
+    @pytest.mark.parametrize("set_to_none", [True, False])
     def test_zero_grad_modes(self, ps, device, set_to_none):
         """Test both zero_grad(set_to_none=True/False) modes work correctly."""
         torch.manual_seed(42 + dist.get_rank())
@@ -204,16 +206,21 @@ class TestCompatibility:
             DistConvDDP(model, grad_reduction_factor=float('nan'))
 
     def test_topology_mismatch_rejected(self, device):
-        """Test rejection when divisor doesn't divide world_size."""
+        """Test that explicit divisors no longer require divisibility.
+
+        After Item 2 fix, explicit grad_reduction_factor accepts any positive value.
+        This test now verifies that non-divisor Q values are ACCEPTED.
+        """
         model = nn.Linear(10, 10).to(device)
         world_size = dist.get_world_size()
 
         # Use a divisor that doesn't divide world_size evenly
-        # For world_size=2 or 4, use 3 as an invalid divisor
-        invalid_divisor = 3 if world_size % 3 != 0 else world_size + 1
+        # For world_size=4, use 3 as a valid non-divisor
+        non_divisor = 3 if world_size % 3 != 0 else world_size + 1
 
-        with pytest.raises(ValueError, match="must be evenly divisible"):
-            DistConvDDP(model, grad_reduction_factor=invalid_divisor)
+        # This should now SUCCEED (not raise)
+        ddp_model = DistConvDDP(model, grad_reduction_factor=non_divisor)
+        assert ddp_model._gradient_divisor == non_divisor
 
     def test_missing_both_arguments(self, device):
         """Test that providing neither argument raises an error."""

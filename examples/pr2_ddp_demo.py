@@ -155,18 +155,24 @@ def test_accumulation(ps: ParallelStrategy, device: torch.device):
     ]
     target = torch.zeros(2, 4, device=device)
 
-    # Reference: compute expected accumulated gradient
-    # (forward all microbatches, accumulate loss, single backward)
+    # Reference: proper accumulation - accumulate all, then sync once
     model.zero_grad()
-    total_loss = 0
-    for x in microbatch_data:
-        output = model(x)
-        total_loss += (output - target).square().mean()
 
-    total_loss.backward()
+    # Accumulate all microbatches without sync
+    for i in range(num_microbatches - 1):
+        with ddp_model.no_sync():
+            output = ddp_model(microbatch_data[i])
+            loss = (output - target).square().mean()
+            loss.backward()
+
+    # Final microbatch with sync (triggers gradient synchronization)
+    output = ddp_model(microbatch_data[-1])
+    loss = (output - target).square().mean()
+    loss.backward()
+
     ref_grad = model.weight.grad.clone()
 
-    # Test accumulation pattern
+    # Test: Same pattern should give same result
     model.zero_grad()
 
     # Accumulate N-1 microbatches without sync

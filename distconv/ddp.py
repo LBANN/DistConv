@@ -105,34 +105,39 @@ class DistConvDDP(DistributedDataParallel):
         # Initialize parent DDP first
         super().__init__(*args, **kwargs)
 
+        # Get process group info
+        pg = self.process_group
+        world_size = dist.get_world_size(pg)
+
         # Determine gradient divisor (Q) - number of data-parallel replicas
         if grad_reduction_factor is None:
+            # Path 1: Derive from ParallelStrategy
             if parallel_strategy is None:
                 raise ValueError(
                     "Either grad_reduction_factor or parallel_strategy must be provided"
                 )
             gradient_divisor = parallel_strategy.ddp_ranks
+
+            # Topology sanity check (redundant but defensive)
+            # ParallelStrategy should guarantee W = S * D, so W % (W/S) = 0
+            if world_size % gradient_divisor != 0:
+                raise ValueError(
+                    f"ParallelStrategy topology error: world_size ({world_size}) "
+                    f"not evenly divisible by ddp_ranks ({gradient_divisor}). "
+                    f"Expected W = S * D."
+                )
         else:
+            # Path 2: Explicit user-provided divisor
             gradient_divisor = grad_reduction_factor
 
-        # Validate gradient divisor
-        if not (isinstance(gradient_divisor, (int, float)) and
-                gradient_divisor > 0 and
-                math.isfinite(gradient_divisor)):
-            raise ValueError(
-                f"grad_reduction_factor must be finite and positive, got {gradient_divisor}"
-            )
-
-        # Get process group info
-        pg = self.process_group
-        world_size = dist.get_world_size(pg)
-
-        # Validate topology compatibility
-        if world_size % gradient_divisor != 0:
-            raise ValueError(
-                f"Process group world size ({world_size}) must be evenly divisible "
-                f"by gradient_divisor ({gradient_divisor})"
-            )
+            # Mathematical constraint only (no topology requirement)
+            # The scaling algorithm SUM(all_grads) / Q works for any positive Q
+            if not (isinstance(gradient_divisor, (int, float)) and
+                    gradient_divisor > 0 and
+                    math.isfinite(gradient_divisor)):
+                raise ValueError(
+                    f"grad_reduction_factor must be finite and positive, got {gradient_divisor}"
+                )
 
         # Store for external access (backward compatibility)
         # Note: DDP already scales gradients by world size, so we multiply by W/Q

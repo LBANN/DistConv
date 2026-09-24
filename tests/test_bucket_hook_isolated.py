@@ -462,13 +462,12 @@ class TestAPICompatibility:
         ddp_model = DistConvDDP(model, parallel_strategy=ps)
 
         # Access registered hook state
-        # DDP stores hooks in self._comm_hooks list
+        # DDP stores hooks as (state, hook_fn) tuples in self._comm_hooks list
         assert hasattr(ddp_model, '_comm_hooks')
         assert len(ddp_model._comm_hooks) > 0
 
-        # Verify state structure
-        hook_entry = ddp_model._comm_hooks[0]
-        state = hook_entry.state
+        # Verify state structure - hook stored as (state, hook_fn) tuple
+        state, hook_fn = ddp_model._comm_hooks[0]
 
         # Verify state has correct process group
         assert hasattr(state, 'process_group')

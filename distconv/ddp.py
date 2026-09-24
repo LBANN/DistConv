@@ -1,4 +1,5 @@
 import dataclasses
+import math
 import torch
 import torch.distributed as dist
 import torch.futures
@@ -117,7 +118,7 @@ class DistConvDDP(DistributedDataParallel):
         # Validate gradient divisor
         if not (isinstance(gradient_divisor, (int, float)) and
                 gradient_divisor > 0 and
-                float(gradient_divisor).is_finite()):
+                math.isfinite(gradient_divisor)):
             raise ValueError(
                 f"grad_reduction_factor must be finite and positive, got {gradient_divisor}"
             )

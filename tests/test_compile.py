@@ -1,14 +1,17 @@
-"""Two-rank eager/Inductor parity checks; run sequentially via bash run.sh."""
+"""Eager and full-graph Inductor parity checks for DCTensor."""
+
 from copy import deepcopy
 from unittest.mock import patch
 
 import pytest
 import torch
 import torch.distributed as dist
-
-from distconv import DCTensor, ParallelStrategy
-from distconv import distconv as implementation
+import torch.nn as nn
 from torch._subclasses.fake_tensor import FakeTensorMode
+from utils import cleanup_parallel_strategy, fp32_allclose
+
+from distconv import DCTensor, DistConvDDP, ParallelStrategy
+from distconv import distconv as implementation
 
 
 @pytest.fixture(autouse=True)
@@ -19,41 +22,54 @@ def isolate_compiler_cache():
 
 
 @pytest.fixture
-def strategy(device):
-    with patch('distconv.distconv.init_device_mesh', wraps=implementation.init_device_mesh) as initialize:
-        strategy = ParallelStrategy(num_shards=dist.get_world_size(), device_type=device.type)
-        assert initialize.call_count == 1
-        yield strategy
-        assert initialize.call_count == 1
+def parallel_strategy(device: torch.device):
+    ps = ParallelStrategy(
+        num_shards=dist.get_world_size(), device_type=device.type
+    )
+    yield ps
+    cleanup_parallel_strategy(ps)
 
 
-def test_fake_halos_do_not_communicate(device):
+def test_fake_halos_do_not_communicate(device: torch.device):
     tensor = torch.randn(1, 4, 16, device=device)
     with FakeTensorMode() as mode:
         fake = mode.from_tensor(tensor)
-        with patch.object(dist, 'batch_isend_irecv', side_effect=AssertionError('fake communication')):
+        with patch.object(
+            dist,
+            "batch_isend_irecv",
+            side_effect=AssertionError("fake communication"),
+        ):
             extended = implementation._forward_halo(fake, 1, 2, 2, 0, 1, 1, True)
-            restored = implementation._backward_halo(extended, 1, 2, 2, 0, 1, 1, True)
+            restored = implementation._backward_halo(
+                extended, 1, 2, 2, 0, 1, 1, True
+            )
         assert extended.shape == (1, 4, 18)
         assert restored.shape == fake.shape
         assert restored.stride() == fake.stride()
 
 
-def test_flatten_roundtrip(strategy, device):
+def test_flatten_roundtrip(
+    parallel_strategy: ParallelStrategy, device: torch.device
+):
     local = torch.randn(2, 4, 16, device=device).transpose(0, 1)
-    value = DCTensor(local, strategy)
+    value = DCTensor(local, parallel_strategy)
     value._is_periodic = (True,)
     value._periodic_shard_padding = (1,)
     for halo in (None, torch.randn(4, 2, 18, device=device)):
         value._tensor_with_halo = halo
         names, metadata = value.__tensor_flatten__()
-        with patch('distconv.distconv.init_device_mesh', side_effect=AssertionError('mesh recreated')):
+        with patch(
+            "distconv.distconv.init_device_mesh",
+            side_effect=AssertionError("mesh recreated"),
+        ):
             restored = DCTensor.__tensor_unflatten__(
-                {name: getattr(value, name) for name in names}, deepcopy(metadata),
-                value.shape, value.stride(),
+                {name: getattr(value, name) for name in names},
+                deepcopy(metadata),
+                value.shape,
+                value.stride(),
             )
-        assert restored._parallel_strategy is strategy
-        assert restored._parallel_strategy.device_mesh is strategy.device_mesh
+        assert restored._parallel_strategy is parallel_strategy
+        assert restored._parallel_strategy.device_mesh is parallel_strategy.device_mesh
         assert restored._tensor is local
         assert restored._tensor_with_halo is halo
         assert restored._is_periodic == (True,)
@@ -61,56 +77,80 @@ def test_flatten_roundtrip(strategy, device):
         assert restored.shape == value.shape
         assert restored.stride() == value.stride()
     restored = DCTensor.__tensor_unflatten__(
-        {'_tensor': local}, metadata, (4, 2, 8), (16, 64, 2)
+        {"_tensor": local}, metadata, (4, 2, 8), (16, 64, 2)
     )
     assert restored.shape == (4, 2, 8)
     assert restored.stride() == (16, 64, 2)
 
 
-def test_compile_arithmetic(strategy, device):
-    compiled = torch.compile(lambda t: t.sin() + 1, backend='inductor', fullgraph=True)
-    with patch('distconv.distconv.init_device_mesh', side_effect=AssertionError('mesh recreated')):
-        for _ in range(2):
-            value = DCTensor(torch.randn(1, 4, 32, device=device), strategy)
-            actual = compiled(value)
-            assert actual._parallel_strategy is strategy
-            torch.testing.assert_close(actual._tensor, value._tensor.sin() + 1)
+def test_compile_arithmetic(
+    parallel_strategy: ParallelStrategy, device: torch.device
+):
+    compiled = torch.compile(
+        lambda t: t.sin() + 1, backend="inductor", fullgraph=True
+    )
+    for _ in range(2):
+        value = DCTensor(torch.randn(1, 4, 32, device=device), parallel_strategy)
+        actual = compiled(value)
+        assert actual._parallel_strategy is parallel_strategy
+        assert fp32_allclose(actual._tensor, value._tensor.sin() + 1)
 
 
-@pytest.mark.parametrize('ndims', [1, 2, 3])
-@pytest.mark.parametrize('periodic', [False, True])
-def test_compile_convolution(strategy, device, periodic, ndims):
+@pytest.mark.parametrize("ndims", [1, 2, 3])
+@pytest.mark.parametrize("periodic", [False, True])
+def test_compile_convolution(
+    parallel_strategy: ParallelStrategy,
+    device: torch.device,
+    periodic: bool,
+    ndims: int,
+):
+    """Compare outputs and gradients using DistConvDDP for synchronization."""
     torch.manual_seed(123)
-    conv_class = getattr(torch.nn, f'Conv{ndims}d')
-    conv = conv_class(4, 8, 3, padding=1,
-                           padding_mode='circular' if periodic else 'zeros').to(device)
-    eager = deepcopy(conv)
-    optimized = deepcopy(conv)
-    compiled = torch.compile(optimized, backend='inductor', fullgraph=True)
+    conv_class = getattr(nn, f"Conv{ndims}d")
+    conv = conv_class(
+        4,
+        8,
+        kernel_size=3,
+        padding=1,
+        padding_mode="circular" if periodic else "zeros",
+    ).to(device)
+    eager = DistConvDDP(deepcopy(conv), parallel_strategy=parallel_strategy)
+    # Compile the convolution in full, keeping DDP's reducer outside the graph.
+    compiled = DistConvDDP(
+        torch.compile(deepcopy(conv), backend="inductor", fullgraph=True),
+        parallel_strategy=parallel_strategy,
+    )
+
     for iteration in range(2):
         torch.manual_seed(200 + iteration)
-        x = torch.randn([1, 4] + [16] * ndims, device=device)
+        shape = [1, 4] + [16] * ndims
+        x = torch.randn(*shape, device=device)
         if ndims > 1:
-            memory_format = torch.channels_last if ndims == 2 else torch.channels_last_3d
+            memory_format = (
+                torch.channels_last if ndims == 2 else torch.channels_last_3d
+            )
             x = x.contiguous(memory_format=memory_format)
         x.requires_grad_()
+
+        # Compute the unsharded reference output and gradients.
         conv.zero_grad(set_to_none=True)
-        reference = conv(x)
-        reference.square().sum().backward()
+        ref_y = conv(x)
+        ref_y.square().sum().backward()
+        rank = dist.get_rank()
+        ref_y_shard = ref_y.chunk(dist.get_world_size(), dim=2)[rank]
+        ref_x_grad_shard = x.grad.chunk(dist.get_world_size(), dim=2)[rank]
+
+        # DistConvDDP reduces and scales parameter gradients for both models.
         for model in (eager, compiled):
             model.zero_grad(set_to_none=True)
-            value = DCTensor.distribute(x.detach().requires_grad_(), strategy)
-            original = value._tensor
-            original_data = original.clone()
-            with patch('distconv.distconv.init_device_mesh', side_effect=AssertionError('mesh recreated')):
-                actual = model(value)
-                actual.square().sum().backward()
-            assert value._tensor is original
-            torch.testing.assert_close(value._tensor, original_data)
-            assert value._tensor_with_halo is None
-            rank = dist.get_rank()
-            torch.testing.assert_close(actual._tensor, reference.chunk(dist.get_world_size(), dim=2)[rank])
-            torch.testing.assert_close(value.grad._tensor, x.grad.chunk(dist.get_world_size(), dim=2)[rank], rtol=1e-3, atol=1e-4)
+            dcx = DCTensor.distribute(
+                x.detach().requires_grad_(), parallel_strategy
+            )
+            dcy = model(dcx)
+            dcy.square().sum().backward()
+
+            assert dcx._tensor_with_halo is None
+            assert fp32_allclose(dcy._tensor, ref_y_shard)
+            assert fp32_allclose(dcx.grad._tensor, ref_x_grad_shard)
             for param, ref_param in zip(model.parameters(), conv.parameters()):
-                dist.all_reduce(param.grad)
-                torch.testing.assert_close(param.grad, ref_param.grad, rtol=1e-4, atol=1e-4)
+                assert fp32_allclose(param.grad, ref_param.grad)

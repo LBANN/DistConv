@@ -1,3 +1,4 @@
+import os
 import pytest
 import torch
 import torch.distributed as dist
@@ -25,7 +26,7 @@ def generate_configs():
 
     return "ndims,shard_dim,kernel_size", configs
 
-
+@pytest.mark.skipif(int(os.environ["WORLD_SIZE"]) < 4, reason="requires 4 ranks")
 @pytest.mark.parametrize(*generate_configs())
 def test_ddp_with_distconv(
     parallel_strategy: ParallelStrategy,

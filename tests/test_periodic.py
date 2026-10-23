@@ -6,6 +6,11 @@ from utils import cleanup_parallel_strategy, fp32_allclose
 
 from distconv import DCTensor, DistConvDDP, ParallelStrategy
 
+@pytest.fixture(scope="module")
+def parallel_strategy(device: torch.device):
+    ps = ParallelStrategy(num_shards=dist.get_world_size(), device_type=device.type)
+    yield ps
+    cleanup_parallel_strategy(ps)
 
 def generate_configs():
     configs = []
@@ -22,6 +27,7 @@ def generate_configs():
 
 @pytest.mark.parametrize(*generate_configs())
 def test_periodic(
+    parallel_strategy: ParallelStrategy,
     ndims: int,
     shard_dim: int,
     kernel_size: int,
@@ -44,9 +50,10 @@ def test_periodic(
         device (torch.device): Torch device to run test with.
     """
     # Set the shard dimension for the parallel strategy
-    parallel_strategy = ParallelStrategy(
-        num_shards=num_shards, shard_dim=shard_dim + 2, device_type=device.type
-    )
+    # parallel_strategy = ParallelStrategy(
+    #     num_shards=num_shards, shard_dim=shard_dim + 2, device_type=device.type
+    # )
+    parallel_strategy.shard_dim = 2 + shard_dim
 
     conv_kwargs = dict(
         kernel_size=kernel_size,
@@ -91,4 +98,4 @@ def test_periodic(
     assert fp32_allclose(ref_x_grad, x_grad)
     assert fp32_allclose(ref_conv_grad, dc_conv_grad)
 
-    cleanup_parallel_strategy(parallel_strategy)
+    # cleanup_parallel_strategy(parallel_strategy)

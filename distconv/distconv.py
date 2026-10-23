@@ -180,6 +180,73 @@ def check_is_distconv_supported(
             )
 
 
+def _exchange_halos(
+    send_halo_minus: torch.Tensor,
+    send_halo_plus: torch.Tensor,
+    shard_ind: int,
+    num_shards: int,
+    minus_rank: int,
+    plus_rank: int,
+    is_periodic: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Abstract halo exchange method.
+
+    Args:
+        send_halo_minus (torch.Tensor): The input tensor halo to send to minus rank.
+        send_halo_plus (torch.Tensor): The input tensor halo to send to plus rank.
+        shard_ind (int): Index of the present shard (in the dimension used for this exchange).
+        num_shards (int): Number of shards (in the dimension used for this exchange).
+        minus_rank (int): Rank of the GPU in the minus direction for exchanging data.
+        plus_rank (int): Rank of the GPU in the plus direction for exchanging data.
+        is_periodic (bool): Is this dimension periodically padded?
+
+    Returns:
+        torch.Tensor: The tensor including the exchanged halos (minus).
+        torch.Tensor: The tensor including the exchanged halos (plus).
+    """
+    halo_minus = torch.zeros_like(send_halo_minus)
+    halo_plus = torch.zeros_like(send_halo_plus)
+    ops = []
+    if shard_ind > 0:
+        # Receive halo from the previous rank and send their halo back
+        ops += [
+            dist.P2POp(dist.irecv, halo_minus, minus_rank),
+            dist.P2POp(
+                dist.isend,
+                send_halo_minus,
+                minus_rank,
+            ),
+        ]
+    if shard_ind < (num_shards - 1) or is_periodic:
+        # Send halo to the next rank and receive their halo
+        ops += [
+            dist.P2POp(
+                dist.isend,
+                send_halo_plus,
+                plus_rank,
+            ),
+            dist.P2POp(dist.irecv, halo_plus, plus_rank),
+        ]
+    if shard_ind == 0 and is_periodic:
+        ops += [
+            dist.P2POp(dist.irecv, halo_minus, minus_rank),
+            dist.P2POp(
+                dist.isend,
+                send_halo_minus,
+                minus_rank,
+            ),
+        ]
+
+    # Execute communication operations
+    if ops:
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+
+    return halo_minus, halo_plus
+
+
 def forward_halo_exchange(
     tensor: torch.Tensor,
     halo_size: int,
@@ -221,48 +288,21 @@ def forward_halo_exchange(
     halo_plus = torch.zeros_like(inner_halo_plus)
 
     # Define communication operations
-    ops = []
     shard_minus = copy(parallel_strategy.shard_ind)
     shard_minus[dim_index] -= 1
     shard_plus = copy(parallel_strategy.shard_ind)
     shard_plus[dim_index] += 1
     minus_rank = parallel_strategy.shard_to_rank(shard_minus)
     plus_rank = parallel_strategy.shard_to_rank(shard_plus)
-    if shard_ind > 0:
-        # Receive halo from the previous rank and send their halo back
-        ops += [
-            dist.P2POp(dist.irecv, halo_minus, minus_rank),
-            dist.P2POp(
-                dist.isend,
-                inner_halo_minus.contiguous(memory_format=memory_format),
-                minus_rank,
-            ),
-        ]
-    if shard_ind < (num_shards - 1) or is_periodic:
-        # Send halo to the next rank and receive their halo
-        ops += [
-            dist.P2POp(
-                dist.isend,
-                inner_halo_plus.contiguous(memory_format=memory_format),
-                plus_rank,
-            ),
-            dist.P2POp(dist.irecv, halo_plus, plus_rank),
-        ]
-    if shard_ind == 0 and is_periodic:
-        ops += [
-            dist.P2POp(dist.irecv, halo_minus, minus_rank),
-            dist.P2POp(
-                dist.isend,
-                inner_halo_minus.contiguous(memory_format=memory_format),
-                minus_rank,
-            ),
-        ]
-
-    # Execute communication operations
-    if ops:
-        reqs = dist.batch_isend_irecv(ops)
-        for req in reqs:
-            req.wait()
+    halo_minus, halo_plus = _exchange_halos(
+        inner_halo_minus.contiguous(memory_format=memory_format),
+        inner_halo_plus.contiguous(memory_format=memory_format),
+        shard_ind,
+        num_shards,
+        minus_rank,
+        plus_rank,
+        is_periodic,
+    )
 
     # Concatenate received halos with the original tensor
     tensor_with_halo = torch.cat([halo_minus, tensor, halo_plus], dim=shard_dim)
@@ -311,49 +351,21 @@ def backward_halo_exchange(
     recv_halo_plus = torch.zeros_like(send_halo_plus)
 
     # Define communication operations
-    ops = []
     shard_minus = copy(parallel_strategy.shard_ind)
     shard_minus[dim_index] -= 1
     shard_plus = copy(parallel_strategy.shard_ind)
     shard_plus[dim_index] += 1
     minus_rank = parallel_strategy.shard_to_rank(shard_minus)
     plus_rank = parallel_strategy.shard_to_rank(shard_plus)
-    if shard_ind > 0:
-        # find neighbouring shard, and which gpu it belongs to
-        # Receive halo from previous rank and send their halo back
-        ops += [
-            dist.P2POp(dist.irecv, recv_halo_minus, minus_rank),
-            dist.P2POp(
-                dist.isend,
-                send_halo_minus.contiguous(memory_format=memory_format),
-                minus_rank,
-            ),
-        ]
-    if shard_ind < (num_shards - 1) or is_periodic:
-        # Send halo to the next rank and receive their halo
-        ops += [
-            dist.P2POp(
-                dist.isend,
-                send_halo_plus.contiguous(memory_format=memory_format),
-                plus_rank,
-            ),
-            dist.P2POp(dist.irecv, recv_halo_plus, plus_rank),
-        ]
-    if shard_ind == 0 and is_periodic:
-        ops += [
-            dist.P2POp(dist.irecv, recv_halo_minus, minus_rank),
-            dist.P2POp(
-                dist.isend,
-                send_halo_minus.contiguous(memory_format=memory_format),
-                minus_rank,
-            ),
-        ]
-
-    # Execute communication operations
-    if ops:
-        reqs = dist.batch_isend_irecv(ops)
-        for req in reqs:
-            req.wait()
+    recv_halo_minus, recv_halo_plus = _exchange_halos(
+        send_halo_minus.contiguous(memory_format=memory_format),
+        send_halo_plus.contiguous(memory_format=memory_format),
+        shard_ind,
+        num_shards,
+        minus_rank,
+        plus_rank,
+        is_periodic,
+    )
 
     # Accumulate received halos into the inner tensor
     inner_tensor = tensor.narrow(

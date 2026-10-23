@@ -9,5 +9,6 @@ def fp32_allclose(a, b, rtol=1e-3, atol=1e-4):
 
 
 def cleanup_parallel_strategy(ps: ParallelStrategy):
-    for g in ps.device_mesh.get_all_groups():
-        dist.destroy_process_group(g)
+    pass
+    # for g in ps.device_mesh.get_all_groups():
+    #     dist.destroy_process_group(g)

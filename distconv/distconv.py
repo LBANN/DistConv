@@ -284,8 +284,6 @@ def forward_halo_exchange(
     # Prepare halos for sending and receiving
     inner_halo_minus = tensor.narrow(shard_dim, 0, halo_size)
     inner_halo_plus = tensor.narrow(shard_dim, -halo_size, halo_size)
-    halo_minus = torch.zeros_like(inner_halo_minus)
-    halo_plus = torch.zeros_like(inner_halo_plus)
 
     # Define communication operations
     shard_minus = copy(parallel_strategy.shard_ind)
@@ -347,8 +345,6 @@ def backward_halo_exchange(
     # Prepare halos for sending and receiving
     send_halo_minus = tensor.narrow(shard_dim, 0, halo_size)
     send_halo_plus = tensor.narrow(shard_dim, -halo_size, halo_size)
-    recv_halo_minus = torch.zeros_like(send_halo_minus)
-    recv_halo_plus = torch.zeros_like(send_halo_plus)
 
     # Define communication operations
     shard_minus = copy(parallel_strategy.shard_ind)

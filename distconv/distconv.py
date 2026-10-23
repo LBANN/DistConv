@@ -1,3 +1,4 @@
+from copy import copy
 from math import prod
 from typing import Callable, Dict, List, Tuple
 
@@ -31,12 +32,10 @@ class ParallelStrategy:
     ParallelStrategy defines the strategy for distributing tensors across multiple devices
     for parallel computation. It includes the number of shards, the dimension along which
     the tensor is sharded, and the device mesh configuration.
-
-    Keep the configuration fixed while a compiled callable uses this strategy.
     """
 
     def __init__(
-        self, num_shards: tuple, shard_dim: tuple = (2,), device_type: str = "cuda", device_mesh = None
+        self, num_shards: tuple, shard_dim: tuple = (2,), device_type: str = "cuda"
     ):
         """
         Initialize the ParallelStrategy.
@@ -67,14 +66,11 @@ class ParallelStrategy:
         mesh_shape = (self.ddp_ranks,) + self.num_shards
         mesh_dim_names = ("ddp",) + self.distconv_dim_names
 
-        # if device_mesh is None:
         self.device_mesh = init_device_mesh(
             device_type,
             mesh_shape=mesh_shape,
             mesh_dim_names=mesh_dim_names,
         )
-        # else:
-        #     self.device_mesh = device_mesh
 
     def shard_to_rank(self, shard_ind):
         if isinstance(shard_ind, int):
@@ -184,32 +180,34 @@ def check_is_distconv_supported(
             )
 
 
-@torch.library.custom_op("distconv::forward_halo", mutates_args=())
-def _forward_halo(
-    tensor: torch.Tensor,
-    halo_size: int,
-    shard_dim: int,
-    num_shards: int,
+@torch.library.custom_op("distconv::exchange_halos", mutates_args=())
+def _exchange_halos(
+    send_halo_minus: torch.Tensor,
+    send_halo_plus: torch.Tensor,
     shard_ind: int,
+    num_shards: int,
     minus_rank: int,
     plus_rank: int,
     is_periodic: bool,
-) -> torch.Tensor:
-    """Run P2P exchange only at runtime, outside compiler tracing."""
-    # Check if halo exchange is needed
-    if halo_size == 0:
-        return tensor.clone()
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Abstract halo exchange method.
 
-    # Detect memory format to preserve throughout operations
-    memory_format = infer_contiguous_format(tensor)
+    Args:
+        send_halo_minus (torch.Tensor): The input tensor halo to send to minus rank.
+        send_halo_plus (torch.Tensor): The input tensor halo to send to plus rank.
+        shard_ind (int): Index of the present shard (in the dimension used for this exchange).
+        num_shards (int): Number of shards (in the dimension used for this exchange).
+        minus_rank (int): Rank of the GPU in the minus direction for exchanging data.
+        plus_rank (int): Rank of the GPU in the plus direction for exchanging data.
+        is_periodic (bool): Is this dimension periodically padded?
 
-    # Prepare halos for sending and receiving
-    inner_halo_minus = tensor.narrow(shard_dim, 0, halo_size)
-    inner_halo_plus = tensor.narrow(shard_dim, -halo_size, halo_size)
-    halo_minus = torch.zeros_like(inner_halo_minus)
-    halo_plus = torch.zeros_like(inner_halo_plus)
-
-    # Define communication operations
+    Returns:
+        torch.Tensor: The tensor including the exchanged halos (minus).
+        torch.Tensor: The tensor including the exchanged halos (plus).
+    """
+    halo_minus = torch.zeros_like(send_halo_minus)
+    halo_plus = torch.zeros_like(send_halo_plus)
     ops = []
     if shard_ind > 0:
         # Receive halo from the previous rank and send their halo back
@@ -217,7 +215,7 @@ def _forward_halo(
             dist.P2POp(dist.irecv, halo_minus, minus_rank),
             dist.P2POp(
                 dist.isend,
-                inner_halo_minus.contiguous(memory_format=memory_format),
+                send_halo_minus,
                 minus_rank,
             ),
         ]
@@ -226,7 +224,7 @@ def _forward_halo(
         ops += [
             dist.P2POp(
                 dist.isend,
-                inner_halo_plus.contiguous(memory_format=memory_format),
+                send_halo_plus,
                 plus_rank,
             ),
             dist.P2POp(dist.irecv, halo_plus, plus_rank),
@@ -236,7 +234,7 @@ def _forward_halo(
             dist.P2POp(dist.irecv, halo_minus, minus_rank),
             dist.P2POp(
                 dist.isend,
-                inner_halo_minus.contiguous(memory_format=memory_format),
+                send_halo_minus,
                 minus_rank,
             ),
         ]
@@ -246,6 +244,68 @@ def _forward_halo(
         reqs = dist.batch_isend_irecv(ops)
         for req in reqs:
             req.wait()
+
+    return halo_minus, halo_plus
+
+
+@_exchange_halos.register_fake
+def _exchange_halos_fake(
+    send_halo_minus, send_halo_plus, shard_ind, num_shards,
+    minus_rank, plus_rank, is_periodic,
+):
+    return torch.empty_like(send_halo_minus), torch.empty_like(send_halo_plus)
+
+
+def forward_halo_exchange(
+    tensor: torch.Tensor,
+    halo_size: int,
+    parallel_strategy: ParallelStrategy,
+    dim_index: int,
+    is_periodic: bool = False,
+) -> torch.Tensor:
+    """
+    Perform forward halo exchange for distributed convolution.
+
+    Args:
+        tensor (torch.Tensor): The input tensor to exchange halos for.
+        halo_size (int): The size of the halo to exchange.
+        parallel_strategy (ParallelStrategy): The parallel strategy containing shard information.
+        dim_index (int): Index into parallel_strategy.shard_dim specifying which
+            sharding dimension to perform the halo exchange for.
+        is_periodic (bool, optional): Whether to use periodic (circular) boundary
+            conditions for this dimension. Defaults to False.
+
+    Returns:
+        torch.Tensor: The tensor including the exchanged halos.
+    """
+    # Check if halo exchange is needed
+    if halo_size == 0:
+        return tensor
+
+    # Detect memory format to preserve throughout operations
+    memory_format = infer_contiguous_format(tensor)
+
+    # Extract parallel strategy parameters
+    shard_dim = parallel_strategy.shard_dim[dim_index]
+    num_shards = parallel_strategy.num_shards[dim_index]
+    shard_ind = parallel_strategy.shard_ind[dim_index]
+
+    # Prepare halos for sending and receiving
+    inner_halo_minus = tensor.narrow(shard_dim, 0, halo_size)
+    inner_halo_plus = tensor.narrow(shard_dim, -halo_size, halo_size)
+
+    # Define communication operations
+    shard_minus = copy(parallel_strategy.shard_ind)
+    shard_minus[dim_index] -= 1
+    shard_plus = copy(parallel_strategy.shard_ind)
+    shard_plus[dim_index] += 1
+    minus_rank = parallel_strategy.shard_to_rank(shard_minus)
+    plus_rank = parallel_strategy.shard_to_rank(shard_plus)
+    halo_minus, halo_plus = _exchange_halos(
+        inner_halo_minus.contiguous(memory_format=memory_format),
+        inner_halo_plus.contiguous(memory_format=memory_format),
+        shard_ind, num_shards, minus_rank, plus_rank, is_periodic,
+    )
 
     # Concatenate received halos with the original tensor
     tensor_with_halo = torch.cat([halo_minus, tensor, halo_plus], dim=shard_dim)
@@ -253,72 +313,56 @@ def _forward_halo(
     return tensor_with_halo
 
 
-@torch.library.custom_op("distconv::backward_halo", mutates_args=())
-def _backward_halo(
+def backward_halo_exchange(
     tensor: torch.Tensor,
     halo_size: int,
-    shard_dim: int,
-    num_shards: int,
-    shard_ind: int,
-    minus_rank: int,
-    plus_rank: int,
-    is_periodic: bool,
+    parallel_strategy: ParallelStrategy,
+    dim_index: int,
+    is_periodic: bool = False,
 ) -> torch.Tensor:
-    """Accumulate halo gradients into a fresh tensor, preserving the input."""
+    """
+    Perform backward halo exchange for distributed convolution.
+
+    Args:
+        tensor (torch.Tensor): The input tensor to exchange halos for.
+        halo_size (int): The size of the halo to exchange.
+        parallel_strategy (ParallelStrategy): The parallel strategy containing shard information.
+        dim_index (int): Index into parallel_strategy.shard_dim specifying which
+            sharding dimension to perform the halo exchange for.
+        is_periodic (bool, optional): Whether to use periodic (circular) boundary
+            conditions for this dimension. Defaults to False.
+
+    Returns:
+        torch.Tensor: The tensor including halo contributions.
+    """
     # Check if halo exchange is needed
     if halo_size == 0:
-        return tensor.clone()
-
-    # The custom operator promises not to mutate or alias its inputs.
-    tensor = tensor.clone()
+        return tensor
 
     # Detect memory format to preserve throughout operations
     memory_format = infer_contiguous_format(tensor)
 
+    # Extract parallel strategy parameters
+    shard_dim = parallel_strategy.shard_dim[dim_index]
+    num_shards = parallel_strategy.num_shards[dim_index]
+    shard_ind = parallel_strategy.shard_ind[dim_index]
+
     # Prepare halos for sending and receiving
     send_halo_minus = tensor.narrow(shard_dim, 0, halo_size)
     send_halo_plus = tensor.narrow(shard_dim, -halo_size, halo_size)
-    recv_halo_minus = torch.zeros_like(send_halo_minus)
-    recv_halo_plus = torch.zeros_like(send_halo_plus)
 
     # Define communication operations
-    ops = []
-    if shard_ind > 0:
-        # find neighbouring shard, and which gpu it belongs to
-        # Receive halo from previous rank and send their halo back
-        ops += [
-            dist.P2POp(dist.irecv, recv_halo_minus, minus_rank),
-            dist.P2POp(
-                dist.isend,
-                send_halo_minus.contiguous(memory_format=memory_format),
-                minus_rank,
-            ),
-        ]
-    if shard_ind < (num_shards - 1) or is_periodic:
-        # Send halo to the next rank and receive their halo
-        ops += [
-            dist.P2POp(
-                dist.isend,
-                send_halo_plus.contiguous(memory_format=memory_format),
-                plus_rank,
-            ),
-            dist.P2POp(dist.irecv, recv_halo_plus, plus_rank),
-        ]
-    if shard_ind == 0 and is_periodic:
-        ops += [
-            dist.P2POp(dist.irecv, recv_halo_minus, minus_rank),
-            dist.P2POp(
-                dist.isend,
-                send_halo_minus.contiguous(memory_format=memory_format),
-                minus_rank,
-            ),
-        ]
-
-    # Execute communication operations
-    if ops:
-        reqs = dist.batch_isend_irecv(ops)
-        for req in reqs:
-            req.wait()
+    shard_minus = copy(parallel_strategy.shard_ind)
+    shard_minus[dim_index] -= 1
+    shard_plus = copy(parallel_strategy.shard_ind)
+    shard_plus[dim_index] += 1
+    minus_rank = parallel_strategy.shard_to_rank(shard_minus)
+    plus_rank = parallel_strategy.shard_to_rank(shard_plus)
+    recv_halo_minus, recv_halo_plus = _exchange_halos(
+        send_halo_minus.contiguous(memory_format=memory_format),
+        send_halo_plus.contiguous(memory_format=memory_format),
+        shard_ind, num_shards, minus_rank, plus_rank, is_periodic,
+    )
 
     # Accumulate received halos into the inner tensor
     inner_tensor = tensor.narrow(
@@ -329,63 +373,7 @@ def _backward_halo(
     inner_halo_minus.add_(recv_halo_minus)
     inner_halo_plus.add_(recv_halo_plus)
 
-    return inner_tensor.contiguous(memory_format=memory_format)
-
-
-def _halo_arguments(strategy, dim_index, is_periodic):
-    minus = list(strategy.shard_ind)
-    plus = list(strategy.shard_ind)
-    minus[dim_index] -= 1
-    plus[dim_index] += 1
-    return (
-        strategy.shard_dim[dim_index], strategy.num_shards[dim_index],
-        strategy.shard_ind[dim_index], strategy.shard_to_rank(minus),
-        strategy.shard_to_rank(plus), is_periodic,
-    )
-
-
-def forward_halo_exchange(
-    tensor: torch.Tensor, halo_size: int, parallel_strategy: ParallelStrategy,
-    dim_index: int, is_periodic: bool = False,
-) -> torch.Tensor:
-    """Extend the local shard with received halos, preserving memory format."""
-    if halo_size == 0:
-        return tensor
-    return _forward_halo(
-        tensor, halo_size, *_halo_arguments(parallel_strategy, dim_index, is_periodic)
-    )
-
-
-def backward_halo_exchange(
-    tensor: torch.Tensor, halo_size: int, parallel_strategy: ParallelStrategy,
-    dim_index: int, is_periodic: bool = False,
-) -> torch.Tensor:
-    """Return the local gradient with contributions from neighboring halos."""
-    if halo_size == 0:
-        return tensor
-    return _backward_halo(
-        tensor, halo_size, *_halo_arguments(parallel_strategy, dim_index, is_periodic)
-    )
-
-
-def _fake_halo(tensor, halo_size, shard_dim, delta):
-    if halo_size == 0:
-        return tensor.clone()
-    shape = list(tensor.shape)
-    shape[shard_dim] += delta * halo_size
-    result = tensor.new_empty(shape)
-    return result.contiguous(memory_format=infer_contiguous_format(tensor))
-
-
-@_forward_halo.register_fake
-def _forward_halo_fake(tensor, halo_size, shard_dim, num_shards, shard_ind, minus_rank, plus_rank, is_periodic):
-    return _fake_halo(tensor, halo_size, shard_dim, 2)
-
-
-@_backward_halo.register_fake
-def _backward_halo_fake(tensor, halo_size, shard_dim, num_shards, shard_ind, minus_rank, plus_rank, is_periodic):
-    # Match the contiguous output of the runtime implementation.
-    return _fake_halo(tensor, halo_size, shard_dim, -2)
+    return inner_tensor
 
 
 def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
@@ -405,7 +393,6 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
 
     # Unpack the necessary arguments
     tensor, weight, bias, stride, padding, dilation = args[:6]
-    padding = list(padding)
 
     # Extract the parallel strategy and shard dimension from the input tensor
     parallel_strategy = tensor._parallel_strategy
@@ -423,6 +410,7 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
 
     # Check if the distributed convolution is supported with the given parameters
     tensor_with_halo = torch_tensor
+    halo_sizes = []
     for i, shard_dim_i in enumerate(shard_dim):
         check_is_distconv_supported(
             shard_dim_i, torch_tensor, weight, stride, padding, dilation
@@ -431,17 +419,26 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
         # Determine the halo size for halo exchange
         kernel_size = weight.size(shard_dim_i)
         halo_size = kernel_size // 2 if (kernel_size % 2 == 1) else 0
+        halo_sizes.append(halo_size)
 
         # Perform forward halo exchange to prepare the tensor for convolution
         tensor_with_halo = forward_halo_exchange(
             tensor_with_halo, halo_size, parallel_strategy, i, is_periodic[i]
         )
 
+        # Save the tensor with its halo for the backward pass.
+        tensor._tensor_with_halo = tensor_with_halo
+
         # Update the arguments with the tensor including halos and adjusted padding
         args[0] = tensor_with_halo
         padding[shard_dim_i - 2] = 0
         args[4] = padding
 
+    tensor._tensor = tensor_with_halo
+    for i, shard_dim_i in enumerate(shard_dim):
+        tensor._tensor = tensor._tensor.narrow(
+            shard_dim_i, halo_sizes[i], tensor.size(shard_dim_i)
+        )
     # Perform the convolution operation
     out_tensor = func(*args, **kwargs)
 
@@ -471,8 +468,6 @@ def distconv_backward(
         :7
     ]
 
-    padding = list(padding)
-
     # Extract the parallel strategy and shard dimension from the gradient output tensor
     parallel_strategy = grad_out_tensor._parallel_strategy
     shard_dim = parallel_strategy.shard_dim
@@ -501,12 +496,19 @@ def distconv_backward(
         halo_sizes.append(halo_size)
         padding[shard_dim_i - 2] = 0
 
-    # Recompute halos without mutating the saved input tensor.
-    input_tensor_with_halo = input_torch_tensor
-    for i, shard_dim_i in enumerate(shard_dim):
-        input_tensor_with_halo = forward_halo_exchange(
-            input_tensor_with_halo, halo_sizes[i], parallel_strategy, i, is_periodic[i]
-        )
+    # Get the input tensor including halos if available, otherwise perform forward halo exchange
+    if input_tensor._tensor_with_halo is not None:
+        input_tensor_with_halo = input_tensor._tensor_with_halo
+    else:
+        input_tensor_with_halo = input_torch_tensor
+        for i, shard_dim_i in enumerate(shard_dim):
+            input_tensor_with_halo = forward_halo_exchange(
+                input_tensor_with_halo,
+                halo_sizes[i],
+                parallel_strategy,
+                i,
+                is_periodic[i],
+            )
 
     # Update the arguments with the gradient output tensor, input tensor including halos, and adjusted padding
     args[0] = grad_out_tensor

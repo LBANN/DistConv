@@ -1,6 +1,5 @@
 """Tests for ParallelStrategy validation."""
 
-import os
 import pytest
 
 from distconv import ParallelStrategy
@@ -24,7 +23,7 @@ def test_shard_dim_negative_value_rejected(device):
     with pytest.raises(ValueError, match="Invalid shard_dim value: -1"):
         ParallelStrategy(num_shards=2, shard_dim=-1, device_type=device.type)
 
-@pytest.mark.skipif(int(os.environ["WORLD_SIZE"]) < 4, reason="requires 4 ranks")
+
 def test_shard_dim_tuple_with_invalid_value_rejected(device):
     """Test that tuple with invalid dimension value is rejected."""
     with pytest.raises(ValueError, match="Invalid shard_dim value: 1"):
@@ -38,7 +37,7 @@ def test_shard_dim_valid_spatial_dimension_accepted(device):
     assert strategy.shard_dim == (2,)
     cleanup_parallel_strategy(strategy)
 
-@pytest.mark.skipif(int(os.environ["WORLD_SIZE"]) < 4, reason="requires 4 ranks")
+
 def test_shard_dim_valid_tuple_accepted(device):
     """Test that valid tuple of spatial dimensions is accepted."""
     # Should not raise any exception

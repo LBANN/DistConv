@@ -9,7 +9,7 @@ from distconv import DCTensor, DistConvDDP, ParallelStrategy
 
 @pytest.fixture(scope="module")
 def parallel_strategy(device: torch.device):
-    ps = ParallelStrategy(num_shards=dist.get_world_size(), device_type=device.type)
+    ps = ParallelStrategy(num_shards=4, device_type=device.type)
     yield ps
     cleanup_parallel_strategy(ps)
 

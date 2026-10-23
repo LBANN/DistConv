@@ -55,7 +55,7 @@ def generate_3d_configs():
 
     return "kernel_size,stride", configs
 
-@pytest.mark.skipif(int(os.environ["WORLD_SIZE"]) < 4, reason="requires 4 ranks")
+
 @pytest.mark.parametrize(*generate_2d_configs())
 def test_2d_splitting(
     parallel_strategy_2d: ParallelStrategy,
@@ -174,7 +174,6 @@ def test_3d_splitting(
     assert fp32_allclose(ref_conv_grad, dc_conv_grad)
 
 
-@pytest.mark.skipif(int(os.environ["WORLD_SIZE"]) < 4, reason="requires 4 ranks")
 @pytest.mark.parametrize(
     "kernel_sizes,padding",
     [
@@ -242,7 +241,6 @@ def test_2d_splitting_nonuniform_kernel(
     )
 
 
-@pytest.mark.skipif(int(os.environ["WORLD_SIZE"]) < 4, reason="requires 4 ranks")
 @pytest.mark.parametrize(
     "kernel_sizes",
     [
@@ -378,7 +376,6 @@ def test_3d_splitting_nonuniform_kernel(
     )
 
 
-@pytest.mark.skipif(int(os.environ["WORLD_SIZE"]) < 4, reason="requires 4 ranks")
 @pytest.mark.parametrize("stride", [1, 2])
 def test_2d_splitting_nonuniform_kernel_with_stride(
     parallel_strategy_2d: ParallelStrategy,

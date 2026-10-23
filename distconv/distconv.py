@@ -5,6 +5,7 @@ from typing import Callable, Dict, List, Tuple
 import torch
 import torch.distributed as dist
 from torch.autograd import Function
+from torch._subclasses.fake_tensor import is_fake
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from torch.utils._pytree import tree_map
@@ -411,6 +412,7 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
     # Check if the distributed convolution is supported with the given parameters
     tensor_with_halo = torch_tensor
     halo_sizes = []
+    cache_halos = not is_fake(torch_tensor)
     for i, shard_dim_i in enumerate(shard_dim):
         check_is_distconv_supported(
             shard_dim_i, torch_tensor, weight, stride, padding, dilation
@@ -426,19 +428,22 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
             tensor_with_halo, halo_size, parallel_strategy, i, is_periodic[i]
         )
 
-        # Save the tensor with its halo for the backward pass.
-        tensor._tensor_with_halo = tensor_with_halo
+        # Keep the flattened structure fixed during tracing. Existing halo
+        # tensors are preserved; uncached compiled inputs recompute in backward.
+        if cache_halos:
+            tensor._tensor_with_halo = tensor_with_halo
 
         # Update the arguments with the tensor including halos and adjusted padding
         args[0] = tensor_with_halo
         padding[shard_dim_i - 2] = 0
         args[4] = padding
 
-    tensor._tensor = tensor_with_halo
-    for i, shard_dim_i in enumerate(shard_dim):
-        tensor._tensor = tensor._tensor.narrow(
-            shard_dim_i, halo_sizes[i], tensor.size(shard_dim_i)
-        )
+    if cache_halos:
+        tensor._tensor = tensor_with_halo
+        for i, shard_dim_i in enumerate(shard_dim):
+            tensor._tensor = tensor._tensor.narrow(
+                shard_dim_i, halo_sizes[i], tensor.size(shard_dim_i)
+            )
     # Perform the convolution operation
     out_tensor = func(*args, **kwargs)
 
@@ -589,6 +594,7 @@ class DCTensor(torch.Tensor):
         return dc_tensor
 
     def __tensor_flatten__(self):
+        """Flatten local data and the halo cache when it contains a tensor."""
         # Guard a snapshot of the configuration while sharing runtime resources.
         names = ["_tensor"]
         if self._tensor_with_halo is not None:
@@ -602,7 +608,8 @@ class DCTensor(torch.Tensor):
 
     @staticmethod
     def __tensor_unflatten__(inner_tensors, flatten_spec, outer_size, outer_stride):
-        strategy_ref, _configuration, periodic, padding = flatten_spec
+        """Restore the halo from inner tensors without recreating mesh resources."""
+        strategy_ref, _, periodic, padding = flatten_spec
         strategy = strategy_ref.strategy
         tensor = inner_tensors["_tensor"]
         result = torch.Tensor._make_wrapper_subclass(

@@ -82,19 +82,33 @@ def test_flatten_roundtrip(
     assert restored.stride() == (16, 64, 2)
 
 
+@pytest.mark.parametrize("with_halo", [False, True])
 def test_compile_arithmetic(
-    parallel_strategy: ParallelStrategy, device: torch.device
+    parallel_strategy: ParallelStrategy, device: torch.device, with_halo: bool
 ):
+    def operation(tensor):
+        halo = tensor._tensor_with_halo
+        return tensor.sin() + 1, None if halo is None else halo.cos()
+
     compiled = torch.compile(
-        lambda t: t.sin() + 1, backend="inductor", fullgraph=True
+        operation, backend="inductor", fullgraph=True
     )
     for _ in range(2):
         value = DCTensor(torch.randn(1, 4, 32, device=device), parallel_strategy)
-        actual = compiled(value)
+        if with_halo:
+            value._tensor_with_halo = torch.randn(1, 4, 34, device=device)
+        halo = value._tensor_with_halo
+        actual, actual_halo = compiled(value)
+        assert value._tensor_with_halo is halo
         assert actual._parallel_strategy is parallel_strategy
         assert fp32_allclose(actual._tensor, value._tensor.sin() + 1)
+        if with_halo:
+            assert fp32_allclose(actual_halo, halo.cos())
+        else:
+            assert actual_halo is None
 
 
+@pytest.mark.parametrize("with_halo", [False, True])
 @pytest.mark.parametrize("ndims", [1, 2, 3])
 @pytest.mark.parametrize("periodic", [False, True])
 def test_compile_convolution(
@@ -102,6 +116,7 @@ def test_compile_convolution(
     device: torch.device,
     periodic: bool,
     ndims: int,
+    with_halo: bool,
 ):
     """Compare outputs and gradients using DistConvDDP for synchronization."""
     torch.manual_seed(123)
@@ -145,7 +160,14 @@ def test_compile_convolution(
             dcx = DCTensor.distribute(
                 x.detach().requires_grad_(), parallel_strategy
             )
+            if with_halo:
+                dcx._tensor_with_halo = implementation.forward_halo_exchange(
+                    dcx._tensor, 1, parallel_strategy, 0, periodic
+                )
+            cached_halo = dcx._tensor_with_halo
             dcy = model(dcx)
+            if model is compiled:
+                assert dcx._tensor_with_halo is cached_halo
             dcy.square().sum().backward()
 
             # assert dcx._tensor_with_halo is None

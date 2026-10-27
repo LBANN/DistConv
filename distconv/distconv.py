@@ -9,6 +9,42 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from torch.utils._pytree import tree_map
 
+# Handlers for ops and functions that need distributed implementations, registered by feature
+# modules (e.g., norm.py) so that they can depend on DCTensor without circular imports.
+_DISPATCH_HANDLERS: Dict[Callable, Callable] = {}
+_FUNCTION_HANDLERS: Dict[Callable, Callable] = {}
+
+
+def register_dispatch(*ops: Callable) -> Callable:
+    """
+    Decorator registering a DCTensor __torch_dispatch__ handler for the given aten ops.
+
+    The handler is called as handler(func, args, kwargs) and must return the op's result.
+    """
+
+    def decorator(handler: Callable) -> Callable:
+        for op in ops:
+            _DISPATCH_HANDLERS[op] = handler
+        return handler
+
+    return decorator
+
+
+def register_function(*funcs: Callable) -> Callable:
+    """
+    Decorator registering a DCTensor __torch_function__ handler for the given torch functions.
+
+    The handler is called as handler(func, types, args, kwargs) and may return NotImplemented to
+    fall back to the default behavior.
+    """
+
+    def decorator(handler: Callable) -> Callable:
+        for func in funcs:
+            _FUNCTION_HANDLERS[func] = handler
+        return handler
+
+    return decorator
+
 
 def infer_contiguous_format(tensor: torch.Tensor) -> torch.memory_format:
     """
@@ -670,7 +706,8 @@ class DCTensor(torch.Tensor):
     def __torch_function__(cls, func, types, args=(), kwargs=None):
         """
         Custom __torch_function__ implementation for DCTensor.
-        Intercepts F.pad when padding_mode='circular' to handle distributed circular padding.
+        Intercepts F.pad when padding_mode='circular' to handle distributed circular padding,
+        and functions with handlers registered via register_function.
 
         Args:
             func (Callable): The function to be dispatched.
@@ -691,6 +728,13 @@ class DCTensor(torch.Tensor):
 
             if isinstance(input_tensor, DCTensor) and mode == "circular":
                 return cls._handle_circular_pad(func, args, kwargs)
+
+        # Use a registered handler if there is one
+        handler = _FUNCTION_HANDLERS.get(func)
+        if handler is not None:
+            result = handler(func, types, args, kwargs)
+            if result is not NotImplemented:
+                return result
 
         # For other functions, use default behavior
         return super().__torch_function__(func, types, args, kwargs)
@@ -760,7 +804,8 @@ class DCTensor(torch.Tensor):
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         """
         Custom __torch_dispatch__ implementation for DCTensor.
-        Intercepts forward/backward convolution ops and performs distributed convolution.
+        Intercepts forward/backward convolution ops and performs distributed convolution, and
+        ops with handlers registered via register_dispatch.
         For other ops, applies the parent class implementation.
 
         Args:
@@ -779,6 +824,8 @@ class DCTensor(torch.Tensor):
             return distconv_forward(func, args, kwargs)
         elif func is torch.ops.aten.convolution_backward.default:
             return distconv_backward(func, args, kwargs)
+        elif func in _DISPATCH_HANDLERS:
+            return _DISPATCH_HANDLERS[func](func, args, kwargs)
 
         def unwrap(t):
             if isinstance(t, DCTensor):

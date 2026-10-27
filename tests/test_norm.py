@@ -196,6 +196,53 @@ def test_instance_norm(
             assert fp32_allclose(dcy._tensor, local_shard(ref_norm(x), parallel_strategy))
 
 
+class TorchInstanceNorm(nn.Module):
+    """Apply an InstanceNorm module's parameters by calling torch.instance_norm directly."""
+
+    def __init__(self, norm: nn.Module):
+        super().__init__()
+        self.norm = norm
+
+    def forward(self, x):
+        n = self.norm
+        return torch.instance_norm(
+            x,
+            n.weight,
+            n.bias,
+            n.running_mean,
+            n.running_var,
+            True,
+            n.momentum,
+            n.eps,
+            torch.backends.cudnn.enabled,
+        )
+
+
+@pytest.mark.parametrize("track_running_stats", [True, False])
+def test_torch_instance_norm(
+    parallel_strategy: ParallelStrategy,
+    track_running_stats: bool,
+    device: torch.device,
+):
+    parallel_strategy.shard_dim = 2
+    x = make_input([2, 8, 16, 16], device)
+    ref_norm = nn.InstanceNorm2d(
+        8, affine=True, track_running_stats=track_running_stats
+    ).to(device)
+    norm = nn.InstanceNorm2d(8, affine=True, track_running_stats=track_running_stats).to(
+        device
+    )
+    norm.load_state_dict(ref_norm.state_dict())
+
+    # Updated twice to match the reference and distributed passes in check_against_reference
+    ref_norm(x)
+    ref_norm(x)
+    check_against_reference(TorchInstanceNorm(norm), x, parallel_strategy)
+    if track_running_stats:
+        assert fp32_allclose(norm.running_mean, ref_norm.running_mean)
+        assert fp32_allclose(norm.running_var, ref_norm.running_var)
+
+
 def generate_layer_norm_configs():
     configs = []
     for ndims in [1, 2, 3]:

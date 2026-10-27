@@ -403,6 +403,7 @@ def backward_halo_exchange(
     return inner_tensor
 
 
+@register_dispatch(torch.ops.aten.convolution.default)
 def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
     """
     Perform the forward pass of the distributed convolution.
@@ -474,6 +475,7 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
     return DCTensor(out_tensor, parallel_strategy)
 
 
+@register_dispatch(torch.ops.aten.convolution_backward.default)
 def distconv_backward(
     func: Callable, args: Tuple, kwargs: Dict
 ) -> Tuple["DCTensor", torch.Tensor, torch.Tensor]:
@@ -706,8 +708,8 @@ class DCTensor(torch.Tensor):
     def __torch_function__(cls, func, types, args=(), kwargs=None):
         """
         Custom __torch_function__ implementation for DCTensor.
-        Intercepts F.pad when padding_mode='circular' to handle distributed circular padding,
-        and functions with handlers registered via register_function.
+        Intercepts functions with handlers registered via register_function (e.g., circular
+        padding).
 
         Args:
             func (Callable): The function to be dispatched.
@@ -721,14 +723,6 @@ class DCTensor(torch.Tensor):
         if kwargs is None:
             kwargs = {}
 
-        # Intercept F.pad when padding_mode='circular'
-        if func is torch.nn.functional.pad:
-            input_tensor = args[0] if args else None
-            mode = kwargs.get("mode", "constant")
-
-            if isinstance(input_tensor, DCTensor) and mode == "circular":
-                return cls._handle_circular_pad(func, args, kwargs)
-
         # Use a registered handler if there is one
         handler = _FUNCTION_HANDLERS.get(func)
         if handler is not None:
@@ -739,73 +733,10 @@ class DCTensor(torch.Tensor):
         # For other functions, use default behavior
         return super().__torch_function__(func, types, args, kwargs)
 
-    @classmethod
-    def _handle_circular_pad(cls, func, args, kwargs):
-        """
-        Handle circular padding for DCTensor by applying normal padding to non-shard dimensions
-        and marking the shard dimension for circular handling during conv operations.
-
-        Args:
-            func (Callable): The F.pad function.
-            args (Tuple): The arguments to F.pad.
-            kwargs (Dict): The keyword arguments to F.pad.
-
-        Returns:
-            DCTensor: The padded tensor with shard dimension marked for circular handling.
-        """
-        input_tensor = args[0]
-        pad = args[1] if len(args) > 1 else kwargs.get("pad")
-
-        parallel_strategy = input_tensor._parallel_strategy
-        shard_dim = parallel_strategy.shard_dim
-        pad_list = list(pad)
-        shard_padding = [
-            0,
-        ] * len(shard_dim)
-        is_periodic = [
-            False,
-        ] * len(shard_dim)
-
-        # Calculate padding indices for shard dimension
-        ndim = input_tensor.dim()
-        for i, shard_dim_i in enumerate(shard_dim):
-            shard_pad_start_idx = 2 * (ndim - 1 - shard_dim_i)
-            shard_pad_end_idx = shard_pad_start_idx + 1
-
-            # Extract and store shard dimension padding
-            if len(pad_list) > shard_pad_end_idx:
-                shard_pad_minus = pad_list[shard_pad_start_idx]
-                shard_pad_plus = pad_list[shard_pad_end_idx]
-
-                assert shard_pad_minus == shard_pad_plus, (
-                    "Periodic padding must be symmetric on sharded dimension"
-                )
-                shard_padding[i] = shard_pad_minus
-                is_periodic[i] = True
-
-                # Disable padding on shard dimension for F.pad
-                pad_list[shard_pad_start_idx] = 0
-                pad_list[shard_pad_end_idx] = 0
-            else:
-                shard_padding[i] = 0
-                is_periodic[i] = False
-
-        # Call F.pad with modified padding (shard dim padding disabled)
-        new_args = (_ToTensor.apply(input_tensor), tuple(pad_list)) + args[2:]
-        partial_padded_tensor = func(*new_args, **kwargs)
-
-        # Create result DCTensor with periodic flag and stored shard padding
-        result: DCTensor = _FromTensor.apply(partial_padded_tensor, parallel_strategy)
-        result._is_periodic = tuple(is_periodic)
-        result._periodic_shard_padding = tuple(shard_padding)
-
-        return result
-
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         """
         Custom __torch_dispatch__ implementation for DCTensor.
-        Intercepts forward/backward convolution ops and performs distributed convolution, and
-        ops with handlers registered via register_dispatch.
+        Intercepts ops with handlers registered via register_dispatch (e.g., convolution).
         For other ops, applies the parent class implementation.
 
         Args:
@@ -820,12 +751,10 @@ class DCTensor(torch.Tensor):
         if kwargs is None:
             kwargs = {}
 
-        if func is torch.ops.aten.convolution.default:
-            return distconv_forward(func, args, kwargs)
-        elif func is torch.ops.aten.convolution_backward.default:
-            return distconv_backward(func, args, kwargs)
-        elif func in _DISPATCH_HANDLERS:
-            return _DISPATCH_HANDLERS[func](func, args, kwargs)
+        # Use a registered handler if there is one
+        handler = _DISPATCH_HANDLERS.get(func)
+        if handler is not None:
+            return handler(func, args, kwargs)
 
         def unwrap(t):
             if isinstance(t, DCTensor):
@@ -896,3 +825,74 @@ class _ToTensor(Function):
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
         return _FromTensor.apply(grad, ctx.parallel_strategy)
+
+
+@register_function(torch.nn.functional.pad)
+def distconv_circular_pad(
+    func: Callable, types: Tuple, args: Tuple, kwargs: Dict
+) -> "DCTensor":
+    """
+    Handle circular padding for DCTensor by applying normal padding to non-shard dimensions
+    and marking the shard dimension for circular handling during conv operations. Other padding
+    modes fall back to the default behavior.
+
+    Args:
+        func (Callable): The F.pad function.
+        types (Tuple): The types of the arguments.
+        args (Tuple): The arguments to F.pad.
+        kwargs (Dict): The keyword arguments to F.pad.
+
+    Returns:
+        DCTensor: The padded tensor with shard dimension marked for circular handling.
+    """
+    input_tensor = args[0] if args else None
+    mode = kwargs.get("mode", "constant")
+    if not (isinstance(input_tensor, DCTensor) and mode == "circular"):
+        return NotImplemented
+
+    pad = args[1] if len(args) > 1 else kwargs.get("pad")
+
+    parallel_strategy = input_tensor._parallel_strategy
+    shard_dim = parallel_strategy.shard_dim
+    pad_list = list(pad)
+    shard_padding = [
+        0,
+    ] * len(shard_dim)
+    is_periodic = [
+        False,
+    ] * len(shard_dim)
+
+    # Calculate padding indices for shard dimension
+    ndim = input_tensor.dim()
+    for i, shard_dim_i in enumerate(shard_dim):
+        shard_pad_start_idx = 2 * (ndim - 1 - shard_dim_i)
+        shard_pad_end_idx = shard_pad_start_idx + 1
+
+        # Extract and store shard dimension padding
+        if len(pad_list) > shard_pad_end_idx:
+            shard_pad_minus = pad_list[shard_pad_start_idx]
+            shard_pad_plus = pad_list[shard_pad_end_idx]
+
+            assert shard_pad_minus == shard_pad_plus, (
+                "Periodic padding must be symmetric on sharded dimension"
+            )
+            shard_padding[i] = shard_pad_minus
+            is_periodic[i] = True
+
+            # Disable padding on shard dimension for F.pad
+            pad_list[shard_pad_start_idx] = 0
+            pad_list[shard_pad_end_idx] = 0
+        else:
+            shard_padding[i] = 0
+            is_periodic[i] = False
+
+    # Call F.pad with modified padding (shard dim padding disabled)
+    new_args = (_ToTensor.apply(input_tensor), tuple(pad_list)) + args[2:]
+    partial_padded_tensor = func(*new_args, **kwargs)
+
+    # Create result DCTensor with periodic flag and stored shard padding
+    result: DCTensor = _FromTensor.apply(partial_padded_tensor, parallel_strategy)
+    result._is_periodic = tuple(is_periodic)
+    result._periodic_shard_padding = tuple(shard_padding)
+
+    return result

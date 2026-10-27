@@ -22,6 +22,7 @@ from .distconv import (
     register_dispatch,
     register_function,
 )
+from .utils import signature_from_schema
 
 
 def _acc_dtype(dtype: torch.dtype) -> torch.dtype:
@@ -498,7 +499,13 @@ def distconv_layer_norm_backward(
     return grad_in, grad_weight, grad_bias
 
 
-@register_function(F.instance_norm)
+_INSTANCE_NORM_SIGNATURES = {
+    F.instance_norm: inspect.signature(F.instance_norm),
+    torch.instance_norm: signature_from_schema(torch.ops.aten.instance_norm.default),
+}
+
+
+@register_function(F.instance_norm, torch.instance_norm)
 def distconv_instance_norm(
     func: Callable, types: Tuple, args: Tuple, kwargs: Dict
 ) -> DCTensor:
@@ -509,21 +516,23 @@ def distconv_instance_norm(
     is purely local and falls back to the default behavior.
 
     Args:
-        func (Callable): The F.instance_norm function.
+        func (Callable): The F.instance_norm or torch.instance_norm function.
         types (Tuple): The types of the arguments.
-        args (Tuple): The positional arguments to F.instance_norm.
-        kwargs (Dict): The keyword arguments to F.instance_norm.
+        args (Tuple): The positional arguments to the function.
+        kwargs (Dict): The keyword arguments to the function.
 
     Returns:
         DCTensor: The normalized tensor.
     """
-    bound = inspect.signature(func).bind(*args, **kwargs)
+    bound = _INSTANCE_NORM_SIGNATURES[func].bind(*args, **kwargs)
     bound.apply_defaults()
-    input, running_mean, running_var, weight, bias, use_input_stats, momentum, eps = (
-        bound.arguments.values()
-    )
-    if not (isinstance(input, DCTensor) and use_input_stats):
+    input = bound.arguments["input"]
+    if not (isinstance(input, DCTensor) and bound.arguments["use_input_stats"]):
         return NotImplemented
+    weight, bias = bound.arguments["weight"], bound.arguments["bias"]
+    running_mean = bound.arguments["running_mean"]
+    running_var = bound.arguments["running_var"]
+    momentum, eps = bound.arguments["momentum"], bound.arguments["eps"]
 
     N, C = input.shape[:2]
     HxW = prod(input.shape[2:])

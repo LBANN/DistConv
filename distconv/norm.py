@@ -290,11 +290,16 @@ def _layer_norm_shard_groups(
     sharded dimensions being normalized over. normalized_shape must use the global (unsharded)
     size of sharded dimensions.
 
-    Note: DCTensor does not track permutations of its dimensions, so this relies on the tensor's
-    shard dimensions being accurate.
+    The local size of each sharded dimension is checked against normalized_shape assuming
+    torch.chunk-style sharding (as produced by DCTensor.distribute), which requires no
+    communication. This also catches stale shard dimensions, e.g., after a permutation, which
+    DCTensor does not track.
 
     Returns:
         List[dist.ProcessGroup]: The process groups to reduce statistics across.
+
+    Raises:
+        ValueError: If the local size of a sharded dimension does not match normalized_shape.
     """
     parallel_strategy = tensor._parallel_strategy
     torch_tensor = tensor._tensor
@@ -302,21 +307,22 @@ def _layer_norm_shard_groups(
 
     dim_indices = []
     for i, shard_dim_i in enumerate(parallel_strategy.shard_dim):
-        if shard_dim_i < axis or parallel_strategy.num_shards[i] == 1:
+        num_shards = parallel_strategy.num_shards[i]
+        if shard_dim_i < axis or num_shards == 1:
             continue
 
-        # Gather the local sizes of all shards along this dimension to get the global size
-        group = parallel_strategy.device_mesh.get_group(i + 1)
-        global_size = torch.tensor(
-            [torch_tensor.size(shard_dim_i)], dtype=torch.int64, device=torch_tensor.device
-        )
-        dist.all_reduce(global_size, group=group)
-        global_size = global_size.item()
+        # Expected local size of this shard when splitting normalized_size like torch.chunk
+        normalized_size = normalized_shape[shard_dim_i - axis]
+        chunk_size = -(-normalized_size // num_shards)
+        offset = parallel_strategy.shard_ind[i] * chunk_size
+        expected_size = min(max(normalized_size - offset, 0), chunk_size)
 
-        if normalized_shape[shard_dim_i - axis] != global_size:
+        local_size = torch_tensor.size(shard_dim_i)
+        if local_size != expected_size:
             raise ValueError(
                 f"DistConv: layer norm normalized_shape {tuple(normalized_shape)} does not match "
-                f"the global size ({global_size}) of sharded dimension {shard_dim_i}"
+                f"sharded dimension {shard_dim_i} (expected local size {expected_size} for a "
+                f"global size of {normalized_size}, got {local_size})"
             )
         dim_indices.append(i)
 
@@ -450,18 +456,18 @@ def distconv_instance_norm(
     # Update the running statistics with the batch-averaged instance statistics
     if running_mean is not None or running_var is not None:
         with torch.no_grad():
-            parallel_strategy = input._parallel_strategy
-            count = torch.tensor(float(HxW), dtype=torch.float64, device=input.device)
-            for group in parallel_strategy.shard_groups():
-                dist.all_reduce(count, group=group)
-            count = count.item()
             if running_mean is not None:
                 running_mean.mul_(1 - momentum).add_(
                     mean.mean(0).to(running_mean.dtype), alpha=momentum
                 )
             if running_var is not None:
+                # Global spatial count for the unbiased variance, kept on the device (and created
+                # with a fill rather than a host-to-device copy) to avoid synchronization
+                count = torch.full((), HxW, dtype=torch.float64, device=input.device)
+                for group in input._parallel_strategy.shard_groups():
+                    dist.all_reduce(count, group=group)
                 var = rstd.double().pow(-2) - eps
-                unbiased_var = var * count / max(count - 1, 1)
+                unbiased_var = var * count / (count - 1).clamp(min=1)
                 running_var.mul_(1 - momentum).add_(
                     unbiased_var.mean(0).to(running_var.dtype), alpha=momentum
                 )

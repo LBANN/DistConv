@@ -753,8 +753,9 @@ class DCTensor(torch.Tensor):
             if result is not NotImplemented:
                 return result
 
-        # For other functions, use default behavior
-        return super().__torch_function__(func, types, args, kwargs)
+        # For other functions, run them without converting outputs to DCTensor (which would
+        # lose DCTensor's attributes); __torch_dispatch__ wraps outputs where appropriate
+        return torch._C._disabled_torch_function_impl(func, types, args, kwargs)
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         """

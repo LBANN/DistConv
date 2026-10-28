@@ -9,7 +9,7 @@ exact. The second section registers the DCTensor handlers that invoke these kern
 
 import inspect
 from math import prod
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -17,8 +17,8 @@ import torch.nn.functional as F
 
 from .distconv import (
     DCTensor,
-    ParallelStrategy,
     infer_contiguous_format,
+    local_tensor,
     register_dispatch,
     register_function,
 )
@@ -65,8 +65,9 @@ def sharded_var_mean(
     """
     x = x.to(_acc_dtype(x.dtype))
     var, mean = torch.var_mean(x, dim=dims, keepdim=True, correction=0)
-    count = torch.full_like(mean, prod(x.size(d) for d in dims))
-    m2 = var * count
+    local_count = prod(x.size(d) for d in dims)
+    m2 = var * local_count
+    count = torch.full_like(mean, local_count)
     for group in groups:
         count, mean, m2 = _merge_var_mean(count, mean, m2, group)
     return mean, m2 / count
@@ -217,26 +218,6 @@ def layer_norm_backward(
 # DCTensor handlers
 
 
-def _local(tensor):
-    """Unwrap a DCTensor to its local tensor, passing anything else through."""
-    return tensor._tensor if isinstance(tensor, DCTensor) else tensor
-
-
-def _shard_groups(
-    parallel_strategy: ParallelStrategy, dim_indices: Iterable[int]
-) -> List[dist.ProcessGroup]:
-    """
-    Get the process groups for the given sharding dimensions (indices into
-    parallel_strategy.shard_dim), skipping dimensions that are not split.
-    """
-    # Mesh dimension 0 is the DDP dimension
-    return [
-        parallel_strategy.device_mesh.get_group(i + 1)
-        for i in dim_indices
-        if parallel_strategy.num_shards[i] > 1
-    ]
-
-
 @register_dispatch(torch.ops.aten.native_group_norm.default)
 def distconv_group_norm_forward(
     func: Callable, args: Tuple, kwargs: Dict
@@ -256,9 +237,9 @@ def distconv_group_norm_forward(
     parallel_strategy = tensor._parallel_strategy
     torch_tensor = tensor._tensor
 
-    groups = _shard_groups(parallel_strategy, range(len(parallel_strategy.shard_dim)))
+    groups = parallel_strategy.shard_groups()
     out, mean, rstd = group_norm_forward(
-        torch_tensor, _local(weight), _local(bias), num_groups, eps, groups
+        torch_tensor, weight, bias, num_groups, eps, groups
     )
     out = out.contiguous(memory_format=infer_contiguous_format(torch_tensor))
     return DCTensor(out, parallel_strategy), mean, rstd
@@ -284,13 +265,13 @@ def distconv_group_norm_backward(
     parallel_strategy = tensor._parallel_strategy
     torch_tensor = tensor._tensor
 
-    groups = _shard_groups(parallel_strategy, range(len(parallel_strategy.shard_dim)))
+    groups = parallel_strategy.shard_groups()
     grad_in, grad_weight, grad_bias = group_norm_backward(
-        _local(grad_out),
+        local_tensor(grad_out),
         torch_tensor,
-        _local(mean),
-        _local(rstd),
-        _local(weight),
+        mean,
+        rstd,
+        weight,
         num_groups,
         output_mask,
         groups,
@@ -339,7 +320,7 @@ def _layer_norm_shard_groups(
             )
         dim_indices.append(i)
 
-    return _shard_groups(parallel_strategy, dim_indices)
+    return parallel_strategy.shard_groups(dim_indices)
 
 
 @register_dispatch(torch.ops.aten.native_layer_norm.default)
@@ -405,7 +386,7 @@ def distconv_layer_norm_backward(
         return None, None, None
     parallel_strategy = tensor._parallel_strategy
     torch_tensor = tensor._tensor
-    grad_out, mean, rstd = _local(grad_out), _local(mean), _local(rstd)
+    grad_out = local_tensor(grad_out)
 
     groups = _layer_norm_shard_groups(tensor, normalized_shape)
     if groups:
@@ -473,9 +454,7 @@ def distconv_instance_norm(
         with torch.no_grad():
             parallel_strategy = input._parallel_strategy
             count = torch.tensor(float(HxW), dtype=torch.float64, device=input.device)
-            for group in _shard_groups(
-                parallel_strategy, range(len(parallel_strategy.shard_dim))
-            ):
+            for group in parallel_strategy.shard_groups():
                 dist.all_reduce(count, group=group)
             count = count.item()
             if running_mean is not None:

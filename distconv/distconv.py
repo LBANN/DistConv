@@ -1,6 +1,6 @@
 from copy import copy
 from math import prod
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -125,6 +125,29 @@ class ParallelStrategy:
             rank += shard_ind_dim_i * stride
             stride *= num_shards_dim_i
         return rank + self.ddp_ind * self.total_num_shards
+
+    def shard_groups(
+        self, dim_indices: Optional[Iterable[int]] = None
+    ) -> List[dist.ProcessGroup]:
+        """
+        Get the process groups for the given sharding dimensions, skipping dimensions that are
+        not split.
+
+        Args:
+            dim_indices (Iterable[int], optional): Indices into shard_dim. Defaults to all
+                sharding dimensions.
+
+        Returns:
+            List[dist.ProcessGroup]: The process group of each split sharding dimension.
+        """
+        if dim_indices is None:
+            dim_indices = range(len(self.shard_dim))
+        # Mesh dimension 0 is the DDP dimension
+        return [
+            self.device_mesh.get_group(i + 1)
+            for i in dim_indices
+            if self.num_shards[i] > 1
+        ]
 
     @property
     def num_shards(self):
@@ -781,6 +804,11 @@ class DCTensor(torch.Tensor):
             str: A string representation of the DCTensor.
         """
         return super().__repr__(tensor_contents=f"{self._tensor}")
+
+
+def local_tensor(tensor):
+    """Unwrap a DCTensor to its local tensor, passing anything else through."""
+    return tensor._tensor if isinstance(tensor, DCTensor) else tensor
 
 
 class _FromTensor(Function):

@@ -20,20 +20,6 @@ def parallel_strategy_2d(device: torch.device):
     cleanup_parallel_strategy(ps)
 
 
-class Permuted(nn.Module):
-    """Apply a module in channels-last order (e.g., ConvNeXt-style LayerNorm)."""
-
-    def __init__(self, module: nn.Module):
-        super().__init__()
-        self.module = module
-
-    def forward(self, x):
-        ndims = x.dim()
-        x = x.permute(0, *range(2, ndims), 1)
-        x = self.module(x)
-        return x.permute(0, ndims - 1, *range(1, ndims - 1))
-
-
 def make_input(shape, device, memory_format=torch.contiguous_format):
     return (
         torch.randn(*shape, device=device)
@@ -144,7 +130,7 @@ def test_norm_channels_last(
     elif norm_type == "instance":
         norm = getattr(nn, f"InstanceNorm{ndims}d")(8, affine=True)
     else:
-        norm = nn.LayerNorm(shape[1:])
+        norm = nn.LayerNorm(shape[1:], elementwise_affine=False)
     dcy = check_against_reference(norm.to(device), x, parallel_strategy)
     assert dcy._tensor.is_contiguous(memory_format=memory_format)
 
@@ -249,9 +235,8 @@ def generate_layer_norm_configs():
         for shard_dim in range(ndims):
             # Number of trailing spatial dims normalized over (plus channels if "all")
             for normalized in ["all", "spatial", "last"]:
-                for elementwise_affine in [True, False]:
-                    configs.append((ndims, shard_dim, normalized, elementwise_affine))
-    return "ndims,shard_dim,normalized,elementwise_affine", configs
+                configs.append((ndims, shard_dim, normalized))
+    return "ndims,shard_dim,normalized", configs
 
 
 def normalized_shape_for(shape, normalized):
@@ -268,14 +253,13 @@ def test_layer_norm(
     ndims: int,
     shard_dim: int,
     normalized: str,
-    elementwise_affine: bool,
     device: torch.device,
 ):
     parallel_strategy.shard_dim = 2 + shard_dim
     shape = [2, 8] + [16] * ndims
     x = make_input(shape, device)
     norm = nn.LayerNorm(
-        normalized_shape_for(shape, normalized), elementwise_affine=elementwise_affine
+        normalized_shape_for(shape, normalized), elementwise_affine=False
     ).to(device)
     check_against_reference(norm, x, parallel_strategy)
 
@@ -288,7 +272,9 @@ def test_layer_norm_2d_splitting(
     parallel_strategy_2d.shard_dim = (2, 3)
     shape = [2, 8, 16, 16]
     x = make_input(shape, device)
-    norm = nn.LayerNorm(normalized_shape_for(shape, normalized)).to(device)
+    norm = nn.LayerNorm(
+        normalized_shape_for(shape, normalized), elementwise_affine=False
+    ).to(device)
     check_against_reference(norm, x, parallel_strategy_2d)
 
 
@@ -296,26 +282,32 @@ def test_layer_norm_uneven(parallel_strategy: ParallelStrategy, device: torch.de
     parallel_strategy.shard_dim = 3
     shape = [2, 8, 16, 10]
     x = make_input(shape, device)
-    norm = nn.LayerNorm(shape[2:]).to(device)
+    norm = nn.LayerNorm(shape[2:], elementwise_affine=False).to(device)
     check_against_reference(norm, x, parallel_strategy)
 
 
-@pytest.mark.parametrize("shard_dim", [0, 1])
-def test_layer_norm_permuted(
-    parallel_strategy: ParallelStrategy, shard_dim: int, device: torch.device
+@pytest.mark.parametrize("normalized", ["all", "last"])
+@pytest.mark.parametrize("bias", [True, False])
+def test_layer_norm_affine_not_supported(
+    parallel_strategy: ParallelStrategy, normalized: str, bias: bool, device: torch.device
 ):
-    # Normalizing over channels in channels-last order needs no reduction across shards
-    parallel_strategy.shard_dim = 2 + shard_dim
-    x = make_input([2, 8, 16, 16], device)
-    norm = Permuted(nn.LayerNorm(8)).to(device)
-    check_against_reference(norm, x, parallel_strategy)
+    # Affine parameters are rejected whether or not the normalized dimensions are sharded
+    parallel_strategy.shard_dim = 2
+    shape = [2, 8, 16, 16]
+    norm = nn.LayerNorm(normalized_shape_for(shape, normalized), bias=bias).to(device)
+    dcx = DCTensor.distribute(torch.randn(*shape, device=device), parallel_strategy)
+    with pytest.raises(NotImplementedError, match="GroupNorm"):
+        norm(dcx)
 
 
+# 12 matches neither the global (16) nor local (4) size; 4 matches the local size, which is no
+# longer accepted since DCTensor cannot tell whether the dimension was permuted
+@pytest.mark.parametrize("last_size", [12, 4])
 def test_layer_norm_shape_mismatch(
-    parallel_strategy: ParallelStrategy, device: torch.device
+    parallel_strategy: ParallelStrategy, last_size: int, device: torch.device
 ):
     parallel_strategy.shard_dim = 3
-    norm = nn.LayerNorm([16, 12]).to(device)
+    norm = nn.LayerNorm([16, last_size], elementwise_affine=False).to(device)
     dcx = DCTensor.distribute(torch.randn(2, 8, 16, 16, device=device), parallel_strategy)
     with pytest.raises(ValueError, match="normalized_shape"):
         norm(dcx)
@@ -333,6 +325,6 @@ def test_conv_group_norm_model(
         nn.Conv2d(8, 8, kernel_size=3, padding=1),
         nn.InstanceNorm2d(8, affine=True),
         nn.Conv2d(8, 4, kernel_size=1),
-        nn.LayerNorm([4, 32, 32]),
+        nn.LayerNorm([4, 32, 32], elementwise_affine=False),
     ).to(device)
     check_against_reference(model, x, parallel_strategy_2d)

@@ -3,9 +3,9 @@
 Run from the repository root (CPU only; no torch.compile):
     torchrun --nproc-per-node=2 --master-addr=127.0.0.1 reproduce_ddp_accumulation.py
 
-Both cases should give a weight gradient of 60. The existing DistConvDDP hook
-gives 60 for a single backward, but 80 for two accumulated microbatches, causing
-the final assertion to fail.
+Both cases should give a weight gradient of 60. Before the fix, DistConvDDP gave
+60 for a single backward, but 80 for two accumulated microbatches, causing the
+final assertion to fail.
 """
 
 import torch

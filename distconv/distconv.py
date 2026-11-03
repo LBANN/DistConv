@@ -815,8 +815,9 @@ class DCTensor(torch.Tensor):
             if result is not NotImplemented:
                 return result
 
-        # Dispatch determines output types; Tensor.__torch_function__ would also
-        # convert ordinary parameter gradients into incomplete DCTensors.
+        # Dispatch determines output types; Tensor.__torch_function__ would convert every tensor
+        # output to a DCTensor without its attributes, including outputs that are intentionally
+        # plain (e.g., replicated norm statistics and ordinary parameter gradients).
         with torch._C.DisableTorchFunctionSubclass():
             return func(*args, **kwargs)
 

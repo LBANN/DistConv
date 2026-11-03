@@ -281,7 +281,9 @@ def distconv_group_norm_backward(
         groups,
     )
     if grad_in is not None:
-        grad_in = grad_in.contiguous(memory_format=infer_contiguous_format(torch_tensor))
+        grad_in = grad_in.contiguous(
+            memory_format=infer_contiguous_format(torch_tensor)
+        )
         grad_in = DCTensor(grad_in, parallel_strategy)
     return grad_in, grad_weight, grad_bias
 

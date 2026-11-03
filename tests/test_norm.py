@@ -197,9 +197,9 @@ def test_instance_norm(
     parallel_strategy.shard_dim = 2 + shard_dim
     x = make_input([2, 8] + [16] * ndims, device)
     norm_class = getattr(nn, f"InstanceNorm{ndims}d")
-    ref_norm = norm_class(
-        8, affine=affine, track_running_stats=track_running_stats
-    ).to(device)
+    ref_norm = norm_class(8, affine=affine, track_running_stats=track_running_stats).to(
+        device
+    )
     norm = norm_class(8, affine=affine, track_running_stats=track_running_stats).to(
         device
     )
@@ -219,7 +219,9 @@ def test_instance_norm(
         ref_norm.eval()
         with torch.no_grad():
             dcy = norm(DCTensor.distribute(x.detach(), parallel_strategy))
-            assert fp32_allclose(dcy._tensor, local_shard(ref_norm(x), parallel_strategy))
+            assert fp32_allclose(
+                dcy._tensor, local_shard(ref_norm(x), parallel_strategy)
+            )
 
 
 # Globally empty spatial inputs (as opposed to empty local shards of a nonempty input) have NaN
@@ -279,9 +281,9 @@ def test_torch_instance_norm(
     ref_norm = nn.InstanceNorm2d(
         8, affine=True, track_running_stats=track_running_stats
     ).to(device)
-    norm = nn.InstanceNorm2d(8, affine=True, track_running_stats=track_running_stats).to(
-        device
-    )
+    norm = nn.InstanceNorm2d(
+        8, affine=True, track_running_stats=track_running_stats
+    ).to(device)
     norm.load_state_dict(ref_norm.state_dict())
 
     # Updated twice to match the reference and distributed passes in check_against_reference
@@ -353,7 +355,10 @@ def test_layer_norm_uneven(parallel_strategy: ParallelStrategy, device: torch.de
 @pytest.mark.parametrize("normalized", ["all", "last"])
 @pytest.mark.parametrize("bias", [True, False])
 def test_layer_norm_affine_not_supported(
-    parallel_strategy: ParallelStrategy, normalized: str, bias: bool, device: torch.device
+    parallel_strategy: ParallelStrategy,
+    normalized: str,
+    bias: bool,
+    device: torch.device,
 ):
     # Affine parameters are rejected whether or not the normalized dimensions are sharded
     parallel_strategy.shard_dim = 2
@@ -376,7 +381,9 @@ def test_layer_norm_shape_mismatch(
 ):
     parallel_strategy.shard_dim = 3
     norm = nn.LayerNorm(normalized_shape, elementwise_affine=False).to(device)
-    dcx = DCTensor.distribute(torch.randn(2, 8, 16, 16, device=device), parallel_strategy)
+    dcx = DCTensor.distribute(
+        torch.randn(2, 8, 16, 16, device=device), parallel_strategy
+    )
     with pytest.raises(ValueError, match="normalized_shape"):
         norm(dcx)
 

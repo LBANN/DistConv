@@ -125,11 +125,15 @@ def group_norm_forward(
     if bias is not None:
         out = out + bias.view(affine_shape)
 
-    # Match the native op, which returns statistics in the input dtype
+    # Match the native op, which returns statistics in the input dtype, except for mixed-type
+    # inputs (reduced-precision input, float32 affine parameters), where they stay in the
+    # parameter dtype. Rounding them would corrupt the backward pass.
+    params = [p for p in (weight, bias) if p is not None]
+    stat_dtype = params[0].dtype if params else x.dtype
     return (
         out.to(x.dtype),
-        mean.view(N, num_groups).to(x.dtype),
-        rstd.view(N, num_groups).to(x.dtype),
+        mean.view(N, num_groups).to(stat_dtype),
+        rstd.view(N, num_groups).to(stat_dtype),
     )
 
 

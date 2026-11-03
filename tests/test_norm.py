@@ -111,6 +111,46 @@ def test_group_norm_uneven(parallel_strategy: ParallelStrategy, device: torch.de
     check_against_reference(norm, x, parallel_strategy)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_group_norm_mixed_precision(
+    parallel_strategy: ParallelStrategy, dtype: torch.dtype, device: torch.device
+):
+    # Reduced-precision input with float32 affine parameters. The input has a small variance
+    # relative to its mean (large rstd), so rounding the saved statistics to the input dtype
+    # would produce badly wrong input gradients. Native mixed-type group norm is only supported on
+    # CPU, so the reference is computed there.
+    parallel_strategy.shard_dim = 2
+    x = 1 + torch.randint(-2, 3, (2, 8, 16)) / 128
+    x = x.to(dtype).requires_grad_(True)
+    norm = nn.GroupNorm(2, 8)
+    nn.init.uniform_(norm.weight, 0.5, 1.5)
+    nn.init.uniform_(norm.bias, -0.5, 0.5)
+
+    ref_y = norm(x)
+    grad_y = torch.randn_like(ref_y)
+    ref_y.backward(grad_y)
+    ref_y, ref_x_grad, grad_y = (t.to(device) for t in (ref_y, x.grad, grad_y))
+    ref_param_grads = [norm.weight.grad.to(device), norm.bias.grad.to(device)]
+    x = x.detach().to(device)
+    norm = norm.to(device)
+    norm.zero_grad()
+
+    ddp_norm = DistConvDDP(norm, parallel_strategy=parallel_strategy)
+    dcx = DCTensor.distribute(x, parallel_strategy).requires_grad_(True)
+    dcy = ddp_norm(dcx)
+    dcy.backward(DCTensor.distribute(grad_y, parallel_strategy))
+
+    def close(a, b):
+        return torch.allclose(a.float(), b.float(), rtol=2e-2, atol=2e-2)
+
+    assert dcy.dtype == dtype and dcx.grad.dtype == dtype
+    assert close(dcy._tensor, local_shard(ref_y, parallel_strategy))
+    assert close(dcx.grad._tensor, local_shard(ref_x_grad, parallel_strategy))
+    for p, ref_grad in zip([norm.weight, norm.bias], ref_param_grads):
+        assert p.grad.dtype == torch.float32
+        assert close(p.grad, ref_grad)
+
+
 @pytest.mark.parametrize(
     "ndims,memory_format", [(2, torch.channels_last), (3, torch.channels_last_3d)]
 )

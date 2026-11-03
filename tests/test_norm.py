@@ -340,14 +340,18 @@ def test_layer_norm_affine_not_supported(
         norm(dcx)
 
 
-# 12 matches neither the global (16) nor local (4) size; 4 matches the local size, which is no
-# longer accepted since DCTensor cannot tell whether the dimension was permuted
-@pytest.mark.parametrize("last_size", [12, 4])
+# The input is (2, 8, 16, 16) with the last dimension sharded 4 ways. For the sharded dimension,
+# 12 matches neither the global (16) nor local (4) size, and 4 matches the local size, which is
+# not accepted since DCTensor cannot tell whether the dimension was permuted. The unsharded
+# dimension must also be validated, as must the number of normalized dimensions.
+@pytest.mark.parametrize(
+    "normalized_shape", [[16, 12], [16, 4], [12, 16], [3, 8, 16, 16, 16]]
+)
 def test_layer_norm_shape_mismatch(
-    parallel_strategy: ParallelStrategy, last_size: int, device: torch.device
+    parallel_strategy: ParallelStrategy, normalized_shape: list, device: torch.device
 ):
     parallel_strategy.shard_dim = 3
-    norm = nn.LayerNorm([16, last_size], elementwise_affine=False).to(device)
+    norm = nn.LayerNorm(normalized_shape, elementwise_affine=False).to(device)
     dcx = DCTensor.distribute(torch.randn(2, 8, 16, 16, device=device), parallel_strategy)
     with pytest.raises(ValueError, match="normalized_shape"):
         norm(dcx)

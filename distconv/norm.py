@@ -445,9 +445,7 @@ def distconv_instance_norm(
 
     N, C = input.shape[:2]
     HxW = prod(input.shape[2:])
-    # Disable __torch_function__ so the (replicated) statistics are not converted to DCTensor
-    with torch._C.DisableTorchFunctionSubclass():
-        out, mean, rstd = torch.native_group_norm(input, weight, bias, N, C, HxW, C, eps)
+    out, mean, rstd = torch.native_group_norm(input, weight, bias, N, C, HxW, C, eps)
 
     # Update the running statistics with the batch-averaged instance statistics
     if running_mean is not None or running_var is not None:

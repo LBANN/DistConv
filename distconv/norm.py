@@ -472,23 +472,26 @@ def distconv_instance_norm(
     HxW = prod(input.shape[2:])
     out, mean, rstd = torch.native_group_norm(input, weight, bias, N, C, HxW, C, eps)
 
-    # Update the running statistics with the batch-averaged instance statistics
+    # Update the running statistics with the batch-averaged instance statistics. As in the native
+    # op, a globally empty spatial input (whose statistics are NaN) leaves them unchanged.
     if running_mean is not None or running_var is not None:
         with torch.no_grad():
+            # Global spatial count, kept on the device (and created with a fill rather than a
+            # host-to-device copy) to avoid synchronization
+            count = torch.full((), HxW, dtype=torch.float64, device=input.device)
+            for group in input._parallel_strategy.shard_groups():
+                dist.all_reduce(count, group=group)
+            nonempty = count > 0
+
             if running_mean is not None:
-                running_mean.mul_(1 - momentum).add_(
-                    mean.mean(0).to(running_mean.dtype), alpha=momentum
-                )
+                batch_mean = mean.mean(0).to(running_mean.dtype)
+                updated = running_mean * (1 - momentum) + batch_mean * momentum
+                running_mean.copy_(torch.where(nonempty, updated, running_mean))
             if running_var is not None:
-                # Global spatial count for the unbiased variance, kept on the device (and created
-                # with a fill rather than a host-to-device copy) to avoid synchronization
-                count = torch.full((), HxW, dtype=torch.float64, device=input.device)
-                for group in input._parallel_strategy.shard_groups():
-                    dist.all_reduce(count, group=group)
                 var = rstd.double().pow(-2) - eps
                 unbiased_var = var * count / (count - 1).clamp(min=1)
-                running_var.mul_(1 - momentum).add_(
-                    unbiased_var.mean(0).to(running_var.dtype), alpha=momentum
-                )
+                batch_var = unbiased_var.mean(0).to(running_var.dtype)
+                updated = running_var * (1 - momentum) + batch_var * momentum
+                running_var.copy_(torch.where(nonempty, updated, running_var))
 
     return out

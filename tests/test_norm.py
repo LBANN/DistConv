@@ -222,6 +222,30 @@ def test_instance_norm(
             assert fp32_allclose(dcy._tensor, local_shard(ref_norm(x), parallel_strategy))
 
 
+# Globally empty spatial inputs (as opposed to empty local shards of a nonempty input) have NaN
+# statistics, which must not be folded into the running statistics. The sharded spatial dimension
+# (2) or an unsharded one is empty. An empty batch does update them (to NaN) in the native op.
+@pytest.mark.parametrize("shape", [(2, 8, 0), (2, 8, 16, 0), (0, 8, 16)])
+def test_instance_norm_empty(
+    parallel_strategy: ParallelStrategy, shape: tuple, device: torch.device
+):
+    parallel_strategy.shard_dim = 2
+    norm_class = getattr(nn, f"InstanceNorm{len(shape) - 2}d")
+    ref_norm = norm_class(8, track_running_stats=True).to(device)
+    norm = norm_class(8, track_running_stats=True).to(device)
+    x = torch.randn(*shape, device=device)
+
+    ref_y = ref_norm(x)
+    dcy = norm(DCTensor.distribute(x, parallel_strategy))
+
+    assert dcy._tensor.shape == local_shard(ref_y, parallel_strategy).shape
+    for buf, ref_buf in [
+        (norm.running_mean, ref_norm.running_mean),
+        (norm.running_var, ref_norm.running_var),
+    ]:
+        torch.testing.assert_close(buf, ref_buf, rtol=0, atol=0, equal_nan=True)
+
+
 class TorchInstanceNorm(nn.Module):
     """Apply an InstanceNorm module's parameters by calling torch.instance_norm directly."""
 

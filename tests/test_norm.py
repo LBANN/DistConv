@@ -1,14 +1,24 @@
+from copy import deepcopy
+
 import pytest
 import torch
 import torch.nn as nn
 from utils import cleanup_parallel_strategy, fp32_allclose
 
 from distconv import DCTensor, DistConvDDP, ParallelStrategy
+from distconv.norm import group_norm_forward
 
 
 @pytest.fixture(scope="module")
 def parallel_strategy(device: torch.device):
     ps = ParallelStrategy(num_shards=4, device_type=device.type)
+    yield ps
+    cleanup_parallel_strategy(ps)
+
+
+@pytest.fixture(scope="module")
+def parallel_strategy_unsharded(device: torch.device):
+    ps = ParallelStrategy(num_shards=1, device_type=device.type)
     yield ps
     cleanup_parallel_strategy(ps)
 
@@ -246,6 +256,118 @@ def test_instance_norm_empty(
         (norm.running_var, ref_norm.running_var),
     ]:
         torch.testing.assert_close(buf, ref_buf, rtol=0, atol=0, equal_nan=True)
+
+
+def relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    return ((actual.double() - expected).abs().max() / expected.abs().max()).item()
+
+
+# Maximum relative error against a float64 reference for correctly computed results
+REDUCED_PRECISION_TOLERANCE = {torch.bfloat16: 1e-2, torch.float16: 1e-3}
+
+
+# Reduced-precision inputs with a small variance relative to their mean (large rstd), for which
+# reduced-precision statistics badly corrupt the input gradient and running mean. This happened
+# without affine parameters, since instance norm followed group norm's statistics dtype rule.
+# Native CPU instance norm is itself imprecise here in some torch versions (2.14 casts float32
+# running statistics to the input dtype), so results are compared against a float64 reference.
+@pytest.mark.parametrize("track_running_stats", [True, False])
+@pytest.mark.parametrize("affine", [True, False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_instance_norm_mixed_precision(
+    parallel_strategy: ParallelStrategy,
+    dtype: torch.dtype,
+    affine: bool,
+    track_running_stats: bool,
+    device: torch.device,
+):
+    parallel_strategy.shard_dim = 2
+    norm = nn.InstanceNorm1d(4, affine=affine, track_running_stats=track_running_stats)
+    if affine:
+        nn.init.uniform_(norm.weight, 0.5, 1.5)
+        nn.init.uniform_(norm.bias, -0.5, 0.5)
+    ref_norm = deepcopy(norm).double()
+    x = (1 + torch.randint(-2, 3, (2, 4, 16)) / 128).to(dtype)
+    grad_y = torch.randn(2, 4, 16).to(dtype)
+
+    ref_x = x.double().requires_grad_(True)
+    ref_y = ref_norm(ref_x)
+    ref_y.backward(grad_y.double())
+
+    norm = norm.to(device)
+    module = DistConvDDP(norm, parallel_strategy=parallel_strategy) if affine else norm
+    dcx = DCTensor.distribute(x.to(device), parallel_strategy).requires_grad_(True)
+    dcy = module(dcx)
+    dcy.backward(DCTensor.distribute(grad_y.to(device), parallel_strategy))
+
+    def check(actual, expected, tolerance):
+        assert relative_error(actual.cpu(), expected.detach().cpu()) < tolerance
+
+    def check_shard(actual, expected, tolerance):
+        check(actual, local_shard(expected.to(device), parallel_strategy), tolerance)
+
+    tolerance = REDUCED_PRECISION_TOLERANCE[dtype]
+    assert dcy.dtype == dtype and dcx.grad.dtype == dtype
+    check_shard(dcy._tensor, ref_y, tolerance)
+    check_shard(dcx.grad._tensor, ref_x.grad, tolerance)
+    if affine:
+        check(norm.weight.grad, ref_norm.weight.grad, 1e-4)
+        check(norm.bias.grad, ref_norm.bias.grad, 1e-4)
+    if track_running_stats:
+        check(norm.running_mean, ref_norm.running_mean, 1e-5)
+        check(norm.running_var, ref_norm.running_var, 1e-5)
+
+
+# The case reported in review, unsharded and sharded (one element per shard): a bfloat16 input
+# with float32 running statistics and no affine parameters. With reduced-precision statistics,
+# the mean of 1.0039 rounds to 1.0, giving input gradients of [-298, -700, -502, 298] and a
+# running mean of 0.1.
+@pytest.mark.parametrize(
+    "strategy_name", ["parallel_strategy_unsharded", "parallel_strategy"]
+)
+def test_instance_norm_mixed_precision_review_case(
+    request: pytest.FixtureRequest, strategy_name: str, device: torch.device
+):
+    parallel_strategy = request.getfixturevalue(strategy_name)
+    parallel_strategy.shard_dim = 2
+    norm = nn.InstanceNorm1d(1, track_running_stats=True).to(device)
+    x = torch.tensor(
+        [[[1.0, 1.0 + 1 / 128, 1.0 + 1 / 128, 1.0]]],
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    grad_y = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]], dtype=x.dtype, device=device)
+
+    dcx = DCTensor.distribute(x, parallel_strategy).requires_grad_(True)
+    norm(dcx).backward(DCTensor.distribute(grad_y, parallel_strategy))
+
+    expected_grad = torch.tensor([[[-298.0, -99.5, 99.5, 298.0]]], device=device)
+    assert torch.equal(
+        dcx.grad._tensor.float(), local_shard(expected_grad, parallel_strategy)
+    )
+    expected_mean = torch.tensor([0.1 * (1 + 1 / 256)], device=device)
+    torch.testing.assert_close(norm.running_mean, expected_mean)
+
+
+# Saved statistics follow native group norm's dtype rule by default, and are kept in full
+# precision for instance norm
+@pytest.mark.parametrize("affine", [True, False])
+@pytest.mark.parametrize("full_precision_stats", [True, False])
+def test_group_norm_forward_stats_dtype(
+    affine: bool, full_precision_stats: bool, device: torch.device
+):
+    x = torch.randn(2, 4, 8, device=device, dtype=torch.bfloat16)
+    weight = torch.ones(4, device=device) if affine else None
+    bias = torch.zeros(4, device=device) if affine else None
+    _, mean, rstd = group_norm_forward(
+        x, weight, bias, 2, 1e-5, [], full_precision_stats=full_precision_stats
+    )
+    if full_precision_stats or affine:
+        expected = torch.float32
+    else:
+        _, native_mean, _ = torch.native_group_norm(x, None, None, 2, 4, 8, 2, 1e-5)
+        expected = native_mean.dtype
+    assert mean.dtype == rstd.dtype == expected
 
 
 class TorchInstanceNorm(nn.Module):

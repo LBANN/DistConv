@@ -1,6 +1,6 @@
 from copy import copy
 from math import prod
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -143,54 +143,119 @@ def check_is_distconv_supported(
     dilation: List[int],
     transpose: bool,
     output_padding: List[int],
+    periodic_padding: Optional[int] = None,
 ) -> None:
     """
     Check if the distributed convolution is supported with the given parameters.
 
+    DistConv exchanges a fixed halo of ``kernel_size // 2`` (odd kernels) or 0
+    (even kernels) along the shard dimension. A configuration is supported only
+    if each shard's output has the right size, lines up with the global output,
+    and depends only on its local input plus that halo.
+
     Args:
         tensor_shard_dim (int): The dimension along which the tensor is sharded.
-        tensor (torch.Tensor): The input tensor.
+        tensor (torch.Tensor): The local input tensor.
         weight (torch.Tensor): The convolution kernel tensor.
         stride (List[int]): The stride of the convolution.
-        padding (List[int]): The padding added to the input tensor.
+        padding (List[int]): The padding added to the input tensor. For periodic
+            tensors this already accounts for the periodic padding.
         dilation (List[int]): The dilation applied to the kernel.
-        transpose (bool): Is transposed convolution.
-        dilation (List[int]): The output padding for transposed convolution.
+        transpose (bool): Whether the convolution is transposed.
+        output_padding (List[int]): The output padding for transposed convolution.
+        periodic_padding (Optional[int]): The circular padding applied along the
+            shard dimension, or None if the tensor is not periodic.
 
     Raises:
-        Exception: If local input size is not equal to stride times output size.
-        Exception: If local output size is not equal to stride times input size for transposed convolution.
+        Exception: If dilation is not 1.
+        Exception: If the local input is smaller than the halo.
+        Exception: If input size is not divisible by stride (regular convolution).
+        Exception: If kernel size is odd and padding is not equivalent to "same"
+            (regular convolution).
+        Exception: If kernel size is even and padding is not zero, or stride is
+            not divisible by kernel size (regular convolution).
+        Exception: If the local output size is not stride times the local input
+            size (transposed convolution).
+        Exception: If the halo does not cover the neighboring inputs the local
+            outputs depend on (transposed convolution).
     """
     shard_dim = tensor_shard_dim - 2
     kernel_size = weight.size(tensor_shard_dim)
+    s = stride[shard_dim]
+    p = padding[shard_dim]
     if dilation[shard_dim] != 1:
         raise Exception("DistConv: dilation must be 1")
 
     input_size = tensor.size(tensor_shard_dim)
-
-    if not transpose:
-        output_size = (input_size + 2 * padding[shard_dim] - kernel_size) // stride[
-            shard_dim
-        ] + 1
-
-        if output_size * stride[shard_dim] != input_size:
-            raise Exception(
-                "DistConv: The input size along the shard dimension must equal the stride times the output size for the local tensors.\n"
-                + "This indicates incompatible kernel size, stride, and/or padding for the given input shape and parallel strategy."
-            )
-    else:
-        output_size = (
-            (input_size - 1) * stride[shard_dim]
-            - 2 * padding[shard_dim]
-            + kernel_size
-            + output_padding[shard_dim]
+    halo_size = kernel_size // 2 if kernel_size % 2 == 1 else 0
+    if input_size < halo_size:
+        raise Exception(
+            f"DistConv: the local input size along the shard dimension ({input_size}) "
+            f"must be at least the halo size ({halo_size})"
         )
 
-        if output_size != input_size * stride[shard_dim]:
-            raise Exception(
-                "DistConv: The output size along the shard dimension must equal the stride times the input size for the local tensors.\n"
-                + "This indicates incompatible kernel size, stride, padding, and/or output padding for the given input shape and parallel strategy."
+    if not transpose:
+        # The halo replaces the padding, so output j reads the same inputs
+        # locally as globally only when the padding equals the halo size.
+        if input_size % s != 0:
+            raise Exception("DistConv: input size must be divisible by stride")
+        if kernel_size % 2 == 1:
+            if (kernel_size // 2) != p:
+                raise Exception(
+                    'DistConv: when kernel size is odd, padding must be equivalent to "same"'
+                )
+        else:
+            if p != 0:
+                raise Exception(
+                    "DistConv: when kernel size is even, padding must be zero"
+                )
+            if s % kernel_size != 0:
+                raise Exception(
+                    "DistConv: when kernel size is even, stride must be divisble by kernel size"
+                )
+        return
+
+    output_size = (input_size - 1) * s - 2 * p + kernel_size + output_padding[shard_dim]
+    if output_size != input_size * s:
+        raise Exception(
+            "DistConv: for transposed convolution, the local output size along the "
+            "shard dimension must equal the stride times the local input size.\n"
+            "This indicates incompatible kernel size, stride, padding, and/or output "
+            "padding for the given input shape and parallel strategy."
+        )
+
+    # Input i contributes to outputs s*i + t - p for kernel taps t in [0, k).
+    # The outputs owned by a shard need this many inputs from each neighbor.
+    needed_left = (kernel_size - 1 - p) // s
+    needed_right = (s - 1 + p) // s
+    if max(needed_left, needed_right) > halo_size:
+        raise Exception(
+            f"DistConv: transposed convolution needs {needed_left} (left) and "
+            f"{needed_right} (right) neighboring inputs along the shard dimension, "
+            f"but the halo size is {halo_size}."
+            + (
+                " Even kernels must not be larger than the stride."
+                if kernel_size % 2 == 0
+                else ""
             )
+        )
+    # The local convolution is run with padding p + s * halo_size.
+    if p + s * halo_size < 0:
+        raise Exception(
+            "DistConv: transposed convolution padding is too small for the "
+            "periodic padding along the shard dimension"
+        )
+    # The periodic halo wraps indefinitely, but the reference only wraps
+    # periodic_padding inputs. They agree only if no output reads past those.
+    if (
+        periodic_padding is not None
+        and max(needed_left, needed_right) > periodic_padding
+    ):
+        raise Exception(
+            f"DistConv: transposed convolution needs {max(needed_left, needed_right)} "
+            "neighboring inputs along the shard dimension, but the periodic padding "
+            f"is only {periodic_padding}"
+        )
 
 
 def forward_halo_exchange(
@@ -432,6 +497,7 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
             dilation,
             transpose,
             output_padding,
+            tensor._periodic_shard_padding[i] if is_periodic[i] else None,
         )
 
         # Determine the halo size for halo exchange
@@ -535,6 +601,7 @@ def distconv_backward(
             dilation,
             transpose,
             output_padding,
+            input_tensor._periodic_shard_padding[i] if is_periodic[i] else None,
         )
         if transpose:
             padding[shard_dim_i - 2] += stride[shard_dim_i - 2] * halo_size

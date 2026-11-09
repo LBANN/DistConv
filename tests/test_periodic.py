@@ -1,5 +1,3 @@
-from math import ceil
-
 import pytest
 import torch
 import torch.distributed as dist
@@ -52,7 +50,7 @@ def test_periodic(
 
     conv_kwargs = dict(
         kernel_size=kernel_size,
-        padding=ceil((kernel_size - stride) / 2),
+        padding=kernel_size // 2,
         bias=False,
         stride=stride,
         padding_mode="circular",

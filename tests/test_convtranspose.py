@@ -168,3 +168,203 @@ def test_transposeconv_circularpadding(
     assert fp32_allclose(ref_y, dcy_merge)
     assert fp32_allclose(ref_x_grad, x_grad)
     assert fp32_allclose(ref_conv_grad, dc_conv_grad)
+
+
+def run_transposeconv_1d(
+    parallel_strategy: ParallelStrategy,
+    device: torch.device,
+    kernel_size: int,
+    stride: int,
+    padding: int,
+    output_padding: int,
+    periodic_padding: int | None,
+):
+    """
+    Run a 1D transposed convolution distributed and non-distributed and compare the
+    output and gradients. If periodic_padding is not None, the input is first padded
+    circularly by that amount.
+    """
+    parallel_strategy.shard_dim = 2
+    x = torch.randn(1, 4, 64, device=device, requires_grad=True)
+    conv = nn.ConvTranspose1d(
+        4,
+        8,
+        kernel_size=kernel_size,
+        stride=stride,
+        padding=padding,
+        output_padding=output_padding,
+    ).to(device)
+
+    def pad(t):
+        if periodic_padding is None:
+            return t
+        return nn.functional.pad(t, (periodic_padding, periodic_padding), "circular")
+
+    conv.zero_grad()
+    ref_y = conv(pad(x))
+    ref_y.square().mean().backward()
+    ref_x_grad = x.grad
+    ref_conv_grad = conv.weight.grad
+
+    conv.zero_grad()
+    dist_conv = DistConvDDP(conv, parallel_strategy=parallel_strategy)
+    dcx = DCTensor.distribute(x, parallel_strategy)
+    dcy = dist_conv(pad(dcx))
+    dcy_merge = dcy.to_replicate()
+    dcy.to_ddp().square().mean().backward()
+    x_grad = dcx.grad.to_replicate()
+    dc_conv_grad = conv.weight.grad
+
+    assert fp32_allclose(ref_y, dcy_merge)
+    assert fp32_allclose(ref_x_grad, x_grad)
+    assert fp32_allclose(ref_conv_grad, dc_conv_grad)
+
+
+@pytest.mark.parametrize(
+    "kernel_size,stride,padding,output_padding,periodic_padding",
+    [
+        # Even kernels no larger than the stride need no halo
+        (2, 2, 0, 0, None),
+        (4, 4, 0, 0, None),
+        (2, 4, 0, 2, None),
+        (2, 2, 2, 0, 1),
+        # Odd kernels with padding other than (kernel_size - 1) / 2
+        (5, 4, 1, 1, None),
+        (1, 2, 0, 1, None),
+        # Periodic padding larger than the halo needed
+        (3, 1, 3, 0, 2),
+        (5, 2, 4, 1, 1),
+    ],
+)
+def test_transposeconv_supported_configs(
+    parallel_strategy: ParallelStrategy,
+    device: torch.device,
+    kernel_size: int,
+    stride: int,
+    padding: int,
+    output_padding: int,
+    periodic_padding: int | None,
+):
+    """
+    Test transposed convolution configurations outside the standard
+    "same"-style setup that DistConv computes correctly.
+    """
+    run_transposeconv_1d(
+        parallel_strategy,
+        device,
+        kernel_size,
+        stride,
+        padding,
+        output_padding,
+        periodic_padding,
+    )
+
+
+@pytest.mark.parametrize(
+    "kernel_size,stride,padding,output_padding,periodic_padding",
+    [
+        # Even kernels larger than the stride need a halo that isn't exchanged
+        (4, 2, 1, 0, None),
+        (6, 2, 2, 0, None),
+        (4, 4, 1, 2, None),
+        (4, 2, 3, 0, 1),
+        # Periodic padding smaller than the halo needed
+        (5, 1, 3, 0, 1),
+        (7, 1, 4, 0, 1),
+        # Periodic padding leaves a negative local padding
+        (1, 3, 2, 0, 1),
+    ],
+)
+def test_transposeconv_unsupported_configs(
+    parallel_strategy: ParallelStrategy,
+    device: torch.device,
+    kernel_size: int,
+    stride: int,
+    padding: int,
+    output_padding: int,
+    periodic_padding: int | None,
+):
+    """
+    Test that transposed convolution configurations DistConv cannot compute
+    correctly raise instead of returning wrong values.
+    """
+    with pytest.raises(Exception, match="DistConv"):
+        run_transposeconv_1d(
+            parallel_strategy,
+            device,
+            kernel_size,
+            stride,
+            padding,
+            output_padding,
+            periodic_padding,
+        )
+
+
+@pytest.mark.parametrize(
+    "kernel_size,stride,padding,padding_mode",
+    [
+        # Padding smaller than the halo
+        (3, 4, 0, "zeros"),
+        (5, 4, 1, "zeros"),
+        (5, 4, 1, "circular"),
+        # Even kernels with nonzero padding
+        (4, 4, 1, "zeros"),
+        (4, 2, 1, "zeros"),
+    ],
+)
+def test_conv_unsupported_configs(
+    parallel_strategy: ParallelStrategy,
+    device: torch.device,
+    kernel_size: int,
+    stride: int,
+    padding: int,
+    padding_mode: str,
+):
+    """
+    Test that regular convolution configurations that produce the right local
+    output size but misaligned halos raise instead of returning wrong values.
+    """
+    parallel_strategy.shard_dim = 2
+    conv = nn.Conv1d(
+        4,
+        8,
+        kernel_size=kernel_size,
+        stride=stride,
+        padding=padding,
+        padding_mode=padding_mode,
+    ).to(device)
+    dist_conv = DistConvDDP(conv, parallel_strategy=parallel_strategy)
+    x = torch.randn(1, 4, 64, device=device)
+    dcx = DCTensor.distribute(x, parallel_strategy)
+    with pytest.raises(Exception, match="DistConv"):
+        dist_conv(dcx)
+
+
+@pytest.mark.parametrize(
+    "conv_cls,kwargs",
+    [
+        (
+            nn.ConvTranspose1d,
+            dict(kernel_size=5, stride=2, padding=2, output_padding=1),
+        ),
+        (nn.Conv1d, dict(kernel_size=5, padding=2)),
+    ],
+)
+def test_halo_larger_than_local_input(
+    parallel_strategy: ParallelStrategy,
+    device: torch.device,
+    conv_cls: type,
+    kwargs: dict,
+):
+    """
+    Test that a local input smaller than the halo raises a DistConv error
+    instead of failing inside the halo exchange.
+    """
+    parallel_strategy.shard_dim = 2
+    conv = conv_cls(4, 8, **kwargs).to(device)
+    dist_conv = DistConvDDP(conv, parallel_strategy=parallel_strategy)
+    # One element per shard, but kernel size 5 needs a halo of 2
+    x = torch.randn(1, 4, 4, device=device)
+    dcx = DCTensor.distribute(x, parallel_strategy)
+    with pytest.raises(Exception, match="DistConv: the local input size"):
+        dist_conv(dcx)

@@ -1,5 +1,6 @@
 """
-Distributed normalization (group, layer, and instance norm) for DCTensor.
+Distributed normalization (group and instance norm) for DCTensor. Layer norm is supported only
+over unsharded dimensions, where it is local to each shard.
 
 The kernels in the first section operate on local (unwrapped) tensors. ``groups`` is a list of
 process groups, one per sharded dimension being normalized over; statistics are combined across
@@ -195,48 +196,6 @@ def group_norm_backward(
     return grad_in, grad_weight, grad_bias
 
 
-def layer_norm_forward(
-    x: torch.Tensor,
-    normalized_ndim: int,
-    eps: float,
-    groups: List[dist.ProcessGroup],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Distributed equivalent of ``aten.native_layer_norm`` (without affine parameters).
-
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: The output, mean and rstd.
-    """
-    dims = tuple(range(x.dim() - normalized_ndim, x.dim()))
-    mean, var = sharded_var_mean(x, dims, groups)
-    rstd = torch.rsqrt(var + eps)
-    out = (x - mean) * rstd
-
-    # Match the native op, which returns statistics in the accumulation dtype
-    return out.to(x.dtype), mean, rstd
-
-
-def layer_norm_backward(
-    grad_out: torch.Tensor,
-    x: torch.Tensor,
-    mean: torch.Tensor,
-    rstd: torch.Tensor,
-    normalized_ndim: int,
-    groups: List[dist.ProcessGroup],
-) -> torch.Tensor:
-    """
-    Distributed equivalent of ``aten.native_layer_norm_backward`` (without affine parameters).
-
-    Returns:
-        torch.Tensor: The gradient with respect to the input.
-    """
-    acc = _acc_dtype(x.dtype)
-    rstd = rstd.to(acc)
-    xhat = (x.to(acc) - mean.to(acc)) * rstd
-    dims = tuple(range(x.dim() - normalized_ndim, x.dim()))
-    return _sharded_input_grad(grad_out.to(acc), xhat, rstd, dims, groups).to(x.dtype)
-
-
 # DCTensor handlers
 
 
@@ -306,66 +265,38 @@ def distconv_group_norm_backward(
     return grad_in, grad_weight, grad_bias
 
 
-def _layer_norm_shard_groups(
-    tensor: DCTensor, normalized_shape: Sequence[int]
-) -> List[dist.ProcessGroup]:
+def _check_layer_norm_unsharded(tensor: DCTensor, normalized_shape: Sequence[int]):
     """
-    Determine the process groups to reduce layer norm statistics across, i.e., those of the
-    sharded dimensions being normalized over. normalized_shape must use the global (unsharded)
-    size of sharded dimensions.
+    Raise if any dimension normalized over by layer norm is sharded. Otherwise the statistics are
+    local to each shard and the native op is exact.
 
-    Every normalized dimension is validated against normalized_shape, since the native op (which
-    would otherwise validate it) is bypassed when statistics are reduced across shards. The local
-    size of each sharded dimension is checked assuming torch.chunk-style sharding (as produced by
-    DCTensor.distribute), which requires no communication. This also catches stale shard
-    dimensions, e.g., after a permutation, which DCTensor does not track.
-
-    Returns:
-        List[dist.ProcessGroup]: The process groups to reduce statistics across.
+    DCTensor does not track permutations, so after one the shard dimension may be stale. A
+    sharded dimension permuted into the normalized dimensions is then still caught by the native
+    op's shape validation, since normalized_shape gives its global size but the input has its
+    local size.
 
     Raises:
-        ValueError: If the size of a normalized dimension does not match normalized_shape.
+        NotImplementedError: If a normalized dimension is sharded.
     """
     parallel_strategy = tensor._parallel_strategy
-    torch_tensor = tensor._tensor
-    axis = torch_tensor.dim() - len(normalized_shape)
-    if axis < 0:
-        raise ValueError(
-            f"DistConv: layer norm normalized_shape {tuple(normalized_shape)} has more "
-            f"dimensions than the input ({torch_tensor.dim()})"
+    ndim = tensor._tensor.dim()
+    normalized_dims = range(max(ndim - len(normalized_shape), 0), ndim)
+    sharded_dims = [
+        dim
+        for dim, num_shards in zip(
+            parallel_strategy.shard_dim, parallel_strategy.num_shards
         )
-
-    # Mesh dimension index of each sharded tensor dimension
-    shard_index = {
-        shard_dim_i: i
-        for i, shard_dim_i in enumerate(parallel_strategy.shard_dim)
-        if parallel_strategy.num_shards[i] > 1
-    }
-
-    dim_indices = []
-    for dim in range(axis, torch_tensor.dim()):
-        normalized_size = normalized_shape[dim - axis]
-        i = shard_index.get(dim)
-        if i is None:
-            expected_size = normalized_size
-        else:
-            # Expected local size of this shard when splitting normalized_size like torch.chunk
-            num_shards = parallel_strategy.num_shards[i]
-            chunk_size = -(-normalized_size // num_shards)
-            offset = parallel_strategy.shard_ind[i] * chunk_size
-            expected_size = min(max(normalized_size - offset, 0), chunk_size)
-            dim_indices.append(i)
-
-        local_size = torch_tensor.size(dim)
-        if local_size != expected_size:
-            kind = "sharded" if i is not None else "unsharded"
-            raise ValueError(
-                f"DistConv: layer norm normalized_shape {tuple(normalized_shape)} does not match "
-                f"{kind} dimension {dim} (expected local size {expected_size} for a global size "
-                f"of {normalized_size}, got {local_size})"
-            )
-
-    return parallel_strategy.shard_groups(dim_indices)
+        if num_shards > 1 and dim in normalized_dims
+    ]
+    if sharded_dims:
+        raise NotImplementedError(
+            f"DistConv: layer norm over sharded dimension(s) {sharded_dims} is not supported "
+            "(only over unsharded dimensions, e.g., channels in a channels-last layout). To "
+            "normalize over channels and spatial dimensions, use GroupNorm(1, C) instead (with a "
+            "per-channel rather than elementwise affine; GroupNorm(1, C, affine=False) is "
+            "equivalent to LayerNorm without one). If you need distributed layer norm, please "
+            "open an issue at https://github.com/LBANN/DistConv/issues."
+        )
 
 
 @register_dispatch(torch.ops.aten.native_layer_norm.default)
@@ -373,8 +304,8 @@ def distconv_layer_norm_forward(
     func: Callable, args: Tuple, kwargs: Dict
 ) -> Tuple[DCTensor, torch.Tensor, torch.Tensor]:
     """
-    Perform the forward pass of layer normalization, reducing statistics across shards when the
-    normalized dimensions are sharded. Affine parameters are not supported.
+    Perform the forward pass of layer normalization over unsharded dimensions, which is local to
+    each shard.
 
     Args:
         func (Callable): The native layer norm function.
@@ -385,37 +316,21 @@ def distconv_layer_norm_forward(
         Tuple[DCTensor, torch.Tensor, torch.Tensor]: The output, mean, and rstd.
 
     Raises:
-        NotImplementedError: If weight or bias is given.
+        NotImplementedError: If a normalized dimension is sharded.
     """
     tensor, normalized_shape, weight, bias, eps = args
-    if weight is not None or bias is not None:
-        raise NotImplementedError(
-            "DistConv: layer norm with elementwise affine parameters is not supported. Use "
-            "elementwise_affine=False, or GroupNorm(1, C) for normalization over channels and "
-            "spatial dimensions with a per-channel affine."
-        )
-    parallel_strategy = tensor._parallel_strategy
-    torch_tensor = tensor._tensor
-
-    groups = _layer_norm_shard_groups(tensor, normalized_shape)
-    if groups:
-        out, mean, rstd = layer_norm_forward(
-            torch_tensor, len(normalized_shape), eps, groups
-        )
-    else:
-        # The normalized dimensions are not sharded, so the native op is exact
-        out, mean, rstd = func(torch_tensor, normalized_shape, None, None, eps)
-    out = out.contiguous(memory_format=infer_contiguous_format(torch_tensor))
-    return DCTensor(out, parallel_strategy), mean, rstd
+    _check_layer_norm_unsharded(tensor, normalized_shape)
+    out, mean, rstd = func(tensor._tensor, normalized_shape, weight, bias, eps)
+    return DCTensor(out, tensor._parallel_strategy), mean, rstd
 
 
 @register_dispatch(torch.ops.aten.native_layer_norm_backward.default)
 def distconv_layer_norm_backward(
     func: Callable, args: Tuple, kwargs: Dict
-) -> Tuple[DCTensor, None, None]:
+) -> Tuple[Optional[DCTensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
-    Perform the backward pass of layer normalization, reducing statistics across shards when the
-    normalized dimensions are sharded. Affine parameters are not supported.
+    Perform the backward pass of layer normalization over unsharded dimensions, which is local to
+    each shard.
 
     Args:
         func (Callable): The native layer norm backward function.
@@ -423,34 +338,21 @@ def distconv_layer_norm_backward(
         kwargs (Dict): The keyword arguments to the layer norm backward function.
 
     Returns:
-        Tuple[DCTensor, None, None]: The gradient with respect to the input tensor (and no weight
-        or bias gradients).
-    """
-    grad_out, tensor, normalized_shape, mean, rstd, _, _, output_mask = args
-    if not output_mask[0]:
-        return None, None, None
-    parallel_strategy = tensor._parallel_strategy
-    torch_tensor = tensor._tensor
-    grad_out = local_tensor(grad_out)
+        Tuple[Optional[DCTensor], Optional[torch.Tensor], Optional[torch.Tensor]]: The gradients
+        with respect to the input tensor, weight, and bias. The weight and bias gradients are
+        local partial sums, to be summed across shards by gradient reduction (e.g., DistConvDDP).
 
-    groups = _layer_norm_shard_groups(tensor, normalized_shape)
-    if groups:
-        grad_in = layer_norm_backward(
-            grad_out, torch_tensor, mean, rstd, len(normalized_shape), groups
-        )
-    else:
-        grad_in, _, _ = func(
-            grad_out,
-            torch_tensor,
-            normalized_shape,
-            mean,
-            rstd,
-            None,
-            None,
-            [True, False, False],
-        )
-    grad_in = grad_in.contiguous(memory_format=infer_contiguous_format(torch_tensor))
-    return DCTensor(grad_in, parallel_strategy), None, None
+    Raises:
+        NotImplementedError: If a normalized dimension is sharded.
+    """
+    grad_out, tensor, normalized_shape, *rest = args
+    _check_layer_norm_unsharded(tensor, normalized_shape)
+    grad_in, grad_weight, grad_bias = func(
+        local_tensor(grad_out), tensor._tensor, normalized_shape, *rest
+    )
+    if grad_in is not None:
+        grad_in = DCTensor(grad_in, tensor._parallel_strategy)
+    return grad_in, grad_weight, grad_bias
 
 
 class _InstanceNorm(torch.autograd.Function):

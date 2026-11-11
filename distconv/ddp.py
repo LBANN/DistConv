@@ -13,11 +13,10 @@ class DistConvDDP(DistributedDataParallel):
         **kwargs,
     ):
         """
-        Custom DistributedDataParallel class for DistConv that scales the gradients by the
-        number of DDP ranks in the parallel strategy or a custom factor.
+        DistributedDataParallel that sums spatial gradients and averages over data replicas.
 
         Args:
-            grad_reduction_factor (float, optional): Factor by which to scale the gradients.
+            grad_reduction_factor (float, optional): Divisor for the summed gradients.
             If None, it will be set to the number of DDP ranks in the parallel_strategy.
             Defaults to None.
             parallel_strategy (ParallelStrategy, optional): The parallel strategy used to
@@ -39,11 +38,13 @@ class DistConvDDP(DistributedDataParallel):
         # Note: DDP already scales the gradients by the world size
         self.grad_reduction_factor = dist.get_world_size() / self.grad_reduction_factor
 
-        def scale_grads_hook(param):
-            if param.grad is not None:
-                param.grad.mul_(self.grad_reduction_factor)
+        scale_factor = self.grad_reduction_factor
 
-        # Register the hook to scale the gradients
+        def scale_grads_hook(grad):
+            return grad * scale_factor
+
+        # Scale each new contribution before accumulation. Scaling param.grad
+        # afterwards would repeatedly scale gradients from earlier microbatches.
         for param in self._module_parameters:
             if param.requires_grad:
-                param.register_post_accumulate_grad_hook(scale_grads_hook)
+                param.register_hook(scale_grads_hook)

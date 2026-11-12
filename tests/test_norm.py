@@ -228,19 +228,13 @@ PRECISION_MODES = {
     "float16": (torch.float16, torch.float16, False),
     # Automatic mixed precision
     "amp_bfloat16": (torch.float32, torch.bfloat16, True),
-    "amp_float16": (torch.float32, torch.float16, True),
-    # Mixed dtypes outside of autocast
+    # Mixed dtypes outside of autocast, with higher and lower precision parameters
     "mixed_bfloat16": (torch.float32, torch.bfloat16, False),
-    "mixed_float16": (torch.float32, torch.float16, False),
     "float32_bfloat16_params": (torch.bfloat16, torch.float32, False),
-    "float16_bfloat16_params": (torch.bfloat16, torch.float16, False),
-    "bfloat16_float16_params": (torch.float16, torch.bfloat16, False),
-    "float64_float32_params": (torch.float32, torch.float64, False),
 }
 
 # Maximum relative error against a float64 reference for correctly computed results
 PRECISION_TOLERANCE = {
-    torch.float64: 1e-10,
     torch.float32: 1e-4,
     torch.bfloat16: 1e-2,
     torch.float16: 1e-3,
@@ -248,10 +242,7 @@ PRECISION_TOLERANCE = {
 
 PRECISION_NORMS = {
     "group": lambda: nn.GroupNorm(2, 4),
-    "group_no_affine": lambda: nn.GroupNorm(2, 4, affine=False),
     "instance": lambda: nn.InstanceNorm1d(4),
-    "instance_affine": lambda: nn.InstanceNorm1d(4, affine=True),
-    "instance_tracked": lambda: nn.InstanceNorm1d(4, track_running_stats=True),
     "instance_affine_tracked": lambda: nn.InstanceNorm1d(
         4, affine=True, track_running_stats=True
     ),

@@ -220,15 +220,16 @@ def relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return ((actual.double() - expected).abs().max() / expected.abs().max()).item()
 
 
-# Precision modes: (parameter dtype, input dtype, autocast). Reduced-precision inputs to float32
-# parameters are computed the same with or without autocast. Native PyTorch rejects the last four
-# combinations (in some cases, on some devices), but any combination is supported here.
+# Precision modes: (parameter dtype, input dtype, autocast)
 PRECISION_MODES = {
+    # A single dtype
     "float32": (torch.float32, torch.float32, False),
     "bfloat16": (torch.bfloat16, torch.bfloat16, False),
     "float16": (torch.float16, torch.float16, False),
+    # Automatic mixed precision
     "amp_bfloat16": (torch.float32, torch.bfloat16, True),
     "amp_float16": (torch.float32, torch.float16, True),
+    # Mixed dtypes outside of autocast
     "mixed_bfloat16": (torch.float32, torch.bfloat16, False),
     "mixed_float16": (torch.float32, torch.float16, False),
     "float32_bfloat16_params": (torch.bfloat16, torch.float32, False),
@@ -257,12 +258,10 @@ PRECISION_NORMS = {
 }
 
 
-# Inputs with a small variance relative to their mean (large rstd), for which reduced-precision
-# statistics badly corrupt the gradients and running mean (as reported in review). Native
-# reduced-precision norms are themselves imprecise here in some cases (e.g., pure bfloat16 group
-# norm and CPU instance norm), so results are compared against a float64 reference computed from
-# the same (rounded) inputs and parameters. The output dtype must match the native op's (which
-# outside of autocast is the input dtype, though native mixed-dtype support varies by device).
+# Inputs with a small variance relative to their mean (large rstd), where rounding the saved
+# statistics to a reduced-precision dtype corrupts the gradients and running statistics. Results
+# are compared against a float64 reference computed from the same rounded inputs and parameters,
+# since native PyTorch rounds the statistics in some of these modes.
 @pytest.mark.parametrize("mode", PRECISION_MODES)
 @pytest.mark.parametrize("norm_name", PRECISION_NORMS)
 def test_norm_precision(
@@ -288,6 +287,8 @@ def test_norm_precision(
     def autocast():
         return torch.autocast(device.type, dtype=dtype, enabled=use_autocast)
 
+    # The output dtype matches native PyTorch's: the input dtype, except where autocast casts the
+    # input (native PyTorch rejects some of the mixed dtypes outside of autocast)
     if use_autocast:
         with autocast(), torch.no_grad():
             native_dtype = deepcopy(norm)(x).dtype
@@ -312,9 +313,8 @@ def test_norm_precision(
     assert dcy.dtype == native_dtype and dcx.grad.dtype == dtype
     check_shard(dcy._tensor, ref_y)
     check_shard(dcx.grad._tensor, ref_x.grad)
-    # The parameter gradients are summed across shards after each shard's partial sum is rounded
-    # to the parameter dtype (autograd casts it before gradient reduction), so the rounding errors
-    # of the partial sums, which may partially cancel, accumulate
+    # Each shard's partial parameter gradient is rounded to the parameter dtype before the
+    # cross-shard sum, so the tolerance scales with the number of shards
     for p, ref_p in zip(norm.parameters(), ref_norm.parameters()):
         assert p.grad.dtype == param_dtype
         check(p.grad, ref_p.grad, param_dtype, parallel_strategy.total_num_shards)
@@ -323,19 +323,23 @@ def test_norm_precision(
             check(buf, ref_buf, param_dtype)
 
 
-# The case reported in review, unsharded and sharded (one element per shard): a bfloat16 input
-# (here under autocast) with float32 running statistics and no affine parameters. With
-# reduced-precision statistics, the mean of 1.0039 rounds to 1.0, giving input gradients of
-# [-298, -700, -502, 298] and a running mean of 0.1.
+# A bfloat16 input whose mean is not representable in bfloat16, with float32 running statistics
+# and no affine parameters, unsharded and sharded down to one element per shard. Rounding the
+# statistics to bfloat16 would corrupt the output, the gradients and the running mean.
+@pytest.mark.parametrize("use_autocast", [False, True])
 @pytest.mark.parametrize(
     "strategy_name", ["parallel_strategy_unsharded", "parallel_strategy"]
 )
-def test_instance_norm_review_case(
-    request: pytest.FixtureRequest, strategy_name: str, device: torch.device
+def test_instance_norm_unrepresentable_mean(
+    request: pytest.FixtureRequest,
+    strategy_name: str,
+    use_autocast: bool,
+    device: torch.device,
 ):
     parallel_strategy = request.getfixturevalue(strategy_name)
     parallel_strategy.shard_dim = 2
     norm = nn.InstanceNorm1d(1, track_running_stats=True).to(device)
+    ref_norm = deepcopy(norm).double()
     x = torch.tensor(
         [[[1.0, 1.0 + 1 / 128, 1.0 + 1 / 128, 1.0]]],
         dtype=torch.bfloat16,
@@ -343,60 +347,27 @@ def test_instance_norm_review_case(
     )
     grad_y = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]], dtype=x.dtype, device=device)
 
+    ref_x = x.double().requires_grad_(True)
+    ref_y = ref_norm(ref_x)
+    ref_y.backward(grad_y.double())
+
     dcx = DCTensor.distribute(x, parallel_strategy).requires_grad_(True)
-    with torch.autocast(device.type, dtype=torch.bfloat16):
+    with torch.autocast(device.type, dtype=torch.bfloat16, enabled=use_autocast):
         dcy = norm(dcx)
     dcy.backward(DCTensor.distribute(grad_y, parallel_strategy))
 
-    expected_grad = torch.tensor([[[-298.0, -99.5, 99.5, 298.0]]], device=device)
-    assert torch.equal(
-        dcx.grad._tensor.float(), local_shard(expected_grad, parallel_strategy)
-    )
-    expected_mean = torch.tensor([0.1 * (1 + 1 / 256)], device=device)
-    torch.testing.assert_close(norm.running_mean, expected_mean)
-
-
-# The reviewer's reproducer for the case above, as written (one rank's view, without autocast),
-# except that the reference is computed in float64 rather than with the same reduced-precision
-# input. The reproducer was written against PyTorch 2.10, whose native instance norm is correct
-# here. In PyTorch 2.14, native instance norm itself gets this case wrong: on CPU, it produces an
-# output of [0, 1.55, 1.55, 0] instead of [-0.78, 0.78, 0.78, -0.78], the input gradients
-# [-298, -700, -502, 298] and a running mean of 0.1001; on GPU, a running mean of 0.1006. A float64
-# reference keeps the expected values correct regardless of the PyTorch version.
-def test_instance_norm_review_reproducer(
-    parallel_strategy_unsharded: ParallelStrategy, device: torch.device
-):
-    strategy = parallel_strategy_unsharded
-
-    actual = torch.nn.InstanceNorm1d(1, affine=False, track_running_stats=True).to(
-        device
-    )
-    reference = deepcopy(actual).double()
-
-    x = torch.tensor(
-        [[[1.0, 1.0 + 1 / 128, 1.0 + 1 / 128, 1.0]]],
-        dtype=torch.bfloat16,
-        device=device,
-        requires_grad=True,
-    )
-    grad_output = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]], dtype=x.dtype, device=device)
-
-    ref_x = x.detach().double().requires_grad_(True)
-    reference_output = reference(ref_x)
-    reference_output.backward(grad_output.double())
-
-    dcx = DCTensor.distribute(x.detach(), strategy).requires_grad_()
-    output = actual(dcx)
-    output.backward(DCTensor.distribute(grad_output, strategy))
-
-    torch.testing.assert_close(output._tensor, reference_output.to(x.dtype))
-    torch.testing.assert_close(dcx.grad._tensor, ref_x.grad.to(x.dtype))
     torch.testing.assert_close(
-        actual.running_mean, reference.running_mean.to(actual.running_mean.dtype)
+        dcy._tensor, local_shard(ref_y.to(x.dtype), parallel_strategy)
+    )
+    torch.testing.assert_close(
+        dcx.grad._tensor, local_shard(ref_x.grad.to(x.dtype), parallel_strategy)
+    )
+    torch.testing.assert_close(
+        norm.running_mean, ref_norm.running_mean.to(norm.running_mean.dtype)
     )
 
 
-# Saved statistics are kept in full precision, unlike native group norm's
+# The saved statistics are float32 for every input dtype
 @pytest.mark.parametrize("affine", [True, False])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_group_norm_forward_stats_dtype(

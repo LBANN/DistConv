@@ -496,7 +496,8 @@ def test_conv_group_norm_model(
         nn.Conv2d(4, 8, kernel_size=3, padding=1),
         nn.GroupNorm(4, 8),
         nn.ReLU(),
-        nn.Conv2d(8, 8, kernel_size=3, padding=1),
+        # Instance norm cancels a per-channel bias, whose gradient is then pure rounding error
+        nn.Conv2d(8, 8, kernel_size=3, padding=1, bias=False),
         nn.InstanceNorm2d(8, affine=True),
         nn.Conv2d(8, 4, kernel_size=1),
     ).to(device)

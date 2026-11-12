@@ -6,6 +6,15 @@ The kernels in the first section operate on local (unwrapped) tensors. ``groups`
 process groups, one per sharded dimension being normalized over; statistics are combined across
 each group in turn. Since the combination is associative, reducing one mesh dimension at a time is
 exact. The second section registers the DCTensor handlers that invoke these kernels.
+
+Precision: the output and input gradient have the input dtype, and the parameter gradients have
+the parameter dtype, as in native PyTorch. The computation and the statistics saved for the
+backward pass are in at least float32 for any combination of dtypes, on every device. Native
+PyTorch rounds the saved statistics to a reduced-precision input dtype in some cases (depending on
+the op, device, and affine parameters), which corrupts the gradients when the variance is small
+relative to the mean, so results are at least as accurate as native and may differ from it within
+reduced-precision tolerance. Native PyTorch also rejects some mixed-dtype combinations that are
+supported here.
 """
 
 import inspect
@@ -106,14 +115,16 @@ def group_norm_forward(
     num_groups: int,
     eps: float,
     groups: List[dist.ProcessGroup],
-    full_precision_stats: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Distributed equivalent of ``aten.native_group_norm``.
+    Distributed equivalent of ``aten.native_group_norm``. The computation and the returned
+    statistics are in the accumulation dtype (at least fp32), and the output is in the input
+    dtype.
 
-    Args:
-        full_precision_stats (bool): Return the statistics in the accumulation dtype (at least
-            fp32) rather than following the native op's dtype rule. See below.
+    The statistics are saved for the backward pass, which reconstructs the normalized input from
+    them. Unlike native group norm, they are never rounded to a reduced-precision input dtype,
+    which badly corrupts the gradients when the variance is small relative to the mean (e.g., a
+    bf16 mean of 1.0039 rounds to 1.0 while rstd is ~200), though the output is unaffected.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: The output, mean (N, G) and rstd (N, G).
@@ -131,28 +142,10 @@ def group_norm_forward(
     if bias is not None:
         out = out + bias.view(affine_shape)
 
-    # The statistics are saved for the backward pass, which reconstructs the normalized input
-    # from them. Rounding them to a reduced-precision input dtype badly corrupts the input
-    # gradient when the variance is small relative to the mean (e.g., a bf16 mean of 1.0039
-    # rounds to 1.0 while rstd is ~200), even though the forward output is unaffected.
-    #
-    # By default, match native group norm, which keeps the statistics in the input dtype except
-    # for mixed-type inputs (reduced-precision input, float32 affine parameters), where they stay
-    # in the parameter dtype. Without affine parameters, native group norm is itself imprecise.
-    #
-    # Native instance norm keeps full-precision statistics in all of these cases on GPU (its batch
-    # norm kernels always save them in fp32), so it uses full_precision_stats. (On CPU it does so
-    # only when given float32 running statistics; torch 2.14 casts those to the input dtype
-    # first, making native CPU instance norm imprecise.)
-    if full_precision_stats:
-        stat_dtype = mean.dtype
-    else:
-        params = [p for p in (weight, bias) if p is not None]
-        stat_dtype = params[0].dtype if params else x.dtype
     return (
         out.to(x.dtype),
-        mean.view(N, num_groups).to(stat_dtype),
-        rstd.view(N, num_groups).to(stat_dtype),
+        mean.view(N, num_groups),
+        rstd.view(N, num_groups),
     )
 
 
@@ -355,54 +348,29 @@ def distconv_layer_norm_backward(
     return grad_in, grad_weight, grad_bias
 
 
-class _InstanceNorm(torch.autograd.Function):
+def _update_running_stat(
+    running: torch.Tensor,
+    batch_stat: torch.Tensor,
+    momentum: float,
+    nonempty: torch.Tensor,
+):
     """
-    Instance normalization of a DCTensor as group normalization with one group per channel,
-    calling the group norm kernels directly (rather than through aten.native_group_norm) so that
-    the statistics are kept in full precision, as in native instance norm.
+    Update a running statistic in place with a batch statistic, as in the native op. The update
+    is computed in the dtype of the batch statistic (at least float32) and rounded to the running
+    statistic's dtype once, as the native op does; rounding each term to a reduced-precision
+    running statistic's dtype would compound the rounding errors.
+
+    Args:
+        running (torch.Tensor): The running statistic, updated in place.
+        batch_stat (torch.Tensor): The batch statistic (at least float32).
+        momentum (float): The weight of the batch statistic.
+        nonempty (torch.Tensor): A boolean scalar tensor. If False (e.g., for a globally empty
+            input, whose statistics are NaN), the running statistic is left unchanged. A tensor
+            rather than a Python bool avoids host-device synchronization.
     """
-
-    @staticmethod
-    def forward(
-        ctx,
-        input: DCTensor,
-        weight: Optional[torch.Tensor],
-        bias: Optional[torch.Tensor],
-        eps: float,
-    ) -> Tuple[DCTensor, torch.Tensor, torch.Tensor]:
-        parallel_strategy = input._parallel_strategy
-        x = input._tensor
-        C = x.shape[1]
-        groups = parallel_strategy.shard_groups()
-        out, mean, rstd = group_norm_forward(
-            x, weight, bias, C, eps, groups, full_precision_stats=True
-        )
-        out = out.contiguous(memory_format=infer_contiguous_format(x))
-
-        ctx.save_for_backward(input, mean, rstd, weight)
-        ctx.mark_non_differentiable(mean, rstd)
-        return DCTensor(out, parallel_strategy), mean, rstd
-
-    @staticmethod
-    def backward(ctx, grad_out: DCTensor, grad_mean: None, grad_rstd: None):
-        input, mean, rstd, weight = ctx.saved_tensors
-        parallel_strategy = input._parallel_strategy
-        x = input._tensor
-        groups = parallel_strategy.shard_groups()
-        grad_in, grad_weight, grad_bias = group_norm_backward(
-            local_tensor(grad_out),
-            x,
-            mean,
-            rstd,
-            weight,
-            x.shape[1],
-            ctx.needs_input_grad[:3],
-            groups,
-        )
-        if grad_in is not None:
-            grad_in = grad_in.contiguous(memory_format=infer_contiguous_format(x))
-            grad_in = DCTensor(grad_in, parallel_strategy)
-        return grad_in, grad_weight, grad_bias, None
+    acc = torch.promote_types(running.dtype, batch_stat.dtype)
+    updated = running.to(acc) * (1 - momentum) + batch_stat * momentum
+    running.copy_(torch.where(nonempty, updated, running.to(acc)))
 
 
 _INSTANCE_NORM_SIGNATURES = {
@@ -417,10 +385,9 @@ def distconv_instance_norm(
 ) -> DCTensor:
     """
     Perform instance normalization of a DCTensor as group normalization with one group per
-    channel, which reduces statistics across shards, keeping full-precision statistics as native
-    instance norm does (see _InstanceNorm and group_norm_forward). The native implementation
-    dispatches to backend-specific batch norm ops. Normalizing with running statistics
-    (use_input_stats=False) is purely local and falls back to the default behavior.
+    channel, which reduces statistics across shards (the native implementation dispatches to
+    backend-specific batch norm ops). Normalizing with running statistics (use_input_stats=False)
+    is purely local and falls back to the default behavior.
 
     Args:
         func (Callable): The F.instance_norm or torch.instance_norm function.
@@ -441,8 +408,12 @@ def distconv_instance_norm(
     running_var = bound.arguments["running_var"]
     momentum, eps = bound.arguments["momentum"], bound.arguments["eps"]
 
+    # Call aten.native_group_norm rather than F.group_norm: under CUDA autocast, group_norm upcasts
+    # its input to float32 (giving a float32 output), but instance norm keeps the input dtype, and
+    # autocast does not affect native_group_norm.
+    N, C = input.shape[:2]
     HxW = prod(input.shape[2:])
-    out, mean, rstd = _InstanceNorm.apply(input, weight, bias, eps)
+    out, mean, rstd = torch.native_group_norm(input, weight, bias, N, C, HxW, C, eps)
 
     # Update the running statistics with the batch-averaged instance statistics. As in the native
     # op, a globally empty spatial input (whose statistics are NaN) leaves them unchanged.
@@ -456,14 +427,12 @@ def distconv_instance_norm(
             nonempty = count > 0
 
             if running_mean is not None:
-                batch_mean = mean.mean(0).to(running_mean.dtype)
-                updated = running_mean * (1 - momentum) + batch_mean * momentum
-                running_mean.copy_(torch.where(nonempty, updated, running_mean))
+                _update_running_stat(running_mean, mean.mean(0), momentum, nonempty)
             if running_var is not None:
                 var = rstd.double().pow(-2) - eps
                 unbiased_var = var * count / (count - 1).clamp(min=1)
-                batch_var = unbiased_var.mean(0).to(running_var.dtype)
-                updated = running_var * (1 - momentum) + batch_var * momentum
-                running_var.copy_(torch.where(nonempty, updated, running_var))
+                _update_running_stat(
+                    running_var, unbiased_var.mean(0), momentum, nonempty
+                )
 
     return out

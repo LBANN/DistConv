@@ -11,17 +11,22 @@ from distconv import DCTensor, ParallelStrategy
 
 
 @pytest.fixture
-def parallel_strategy(device):
+def parallel_strategy(request, device):
     if dist.get_world_size() < 2:
         pytest.skip("Inference halo regression requires at least two ranks")
-    strategy = ParallelStrategy(dist.get_world_size(), device_type=device.type)
+    strategy = ParallelStrategy(
+        dist.get_world_size(),
+        shard_dim=(getattr(request, "param", 2),),
+        device_type=device.type,
+    )
     yield strategy
     cleanup_parallel_strategy(strategy)
 
 
-def _input(ndims, device):
+def _input(ndims, device, shard_dim=2):
     torch.manual_seed(123)
-    shape = [2, 4, 8 * dist.get_world_size()] + [8] * (ndims - 1)
+    shape = [2, 4] + [8] * ndims
+    shape[shard_dim] *= dist.get_world_size()
     value = torch.randn(shape, device=device)
     if ndims > 1:
         value = value.contiguous(
@@ -38,11 +43,16 @@ def _mode(name):
     }[name]()
 
 
-def _assert_global_reference(operation, value, strategy, mode):
+def _assert_global_reference(operation, value, strategy, mode, parameters=()):
+    shard_dim = strategy.shard_dim[0]
+
+    def local_chunk(tensor):
+        return tensor.chunk(dist.get_world_size(), dim=shard_dim)[dist.get_rank()]
+
     with _mode(mode):
         expected = operation(value)
-        local = value.chunk(dist.get_world_size(), dim=2)[dist.get_rank()]
-        shard = DCTensor.from_shard(local.detach().clone().requires_grad_(), strategy)
+        local = local_chunk(value).detach().clone().requires_grad_()
+        shard = DCTensor.from_shard(local, strategy)
         actual = operation(shard)
         assert isinstance(actual, DCTensor)
         assert actual._parallel_strategy is strategy
@@ -50,10 +60,21 @@ def _assert_global_reference(operation, value, strategy, mode):
         assert actual.is_inference() == (mode == "inference")
         torch.testing.assert_close(
             actual._tensor,
-            expected.chunk(dist.get_world_size(), dim=2)[dist.get_rank()],
+            local_chunk(expected),
             rtol=1e-4,
             atol=1e-5,
         )
+        if mode == "train" and parameters:
+            expected_grads = torch.autograd.grad(expected.sum(), (value, *parameters))
+            actual_grads = torch.autograd.grad(actual.sum(), (local, *parameters))
+            torch.testing.assert_close(
+                actual_grads[0], local_chunk(expected_grads[0]), rtol=1e-4, atol=1e-4
+            )
+            for actual_grad, expected_grad in zip(actual_grads[1:], expected_grads[1:]):
+                dist.all_reduce(actual_grad)
+                torch.testing.assert_close(
+                    actual_grad, expected_grad, rtol=1e-4, atol=1e-4
+                )
 
 
 @pytest.mark.parametrize("mode", ["train", "no_grad", "inference"])
@@ -132,6 +153,35 @@ def test_string_padding_matches_global_native(
 
 
 @pytest.mark.parametrize("mode", ["train", "no_grad", "inference"])
+@pytest.mark.parametrize(
+    "ndims,parallel_strategy", [(2, 3), (3, 3), (3, 4)], indirect=["parallel_strategy"]
+)
+@pytest.mark.parametrize("case", ["frontend_valid", "mode_valid", "mode_same"])
+def test_singleton_convolution_arguments_on_later_axes(
+    parallel_strategy, device, mode, ndims, case
+):
+    """Native decompositions may pass singleton lists to forward and backward."""
+    value = _input(ndims, device, parallel_strategy.shard_dim[0])
+    padding = "same" if case == "mode_same" else "valid"
+    kernel = 3 if padding == "same" else 1
+    weight = torch.randn(6, 4, *([kernel] * ndims), device=device).requires_grad_()
+    bias = torch.randn(6, device=device, requires_grad=True)
+
+    def run(tensor):
+        if case == "frontend_valid":
+            return getattr(torch.nn.functional, f"conv{ndims}d")(
+                tensor, weight, bias, padding=padding
+            )
+        return torch.ops.aten._convolution_mode.default(
+            tensor, weight, bias, [1], padding, [1], 1
+        )
+
+    _assert_global_reference(
+        run, value, parallel_strategy, mode, parameters=(weight, bias)
+    )
+
+
+@pytest.mark.parametrize("mode", ["train", "no_grad", "inference"])
 @pytest.mark.parametrize("ndims", [2, 3])
 def test_asymmetric_same_padding_on_unsharded_axis(
     parallel_strategy, device, mode, ndims
@@ -153,7 +203,11 @@ def test_asymmetric_same_padding_on_unsharded_axis(
 @pytest.mark.parametrize(
     "padding,kernel,message",
     [
-        ("same", 2, "DistConv: asymmetric padding='same'"),
+        (
+            "same",
+            2,
+            "DistConv: when kernel size is even, stride must be divisble by kernel size",
+        ),
         (
             "valid",
             3,

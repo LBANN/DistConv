@@ -486,6 +486,104 @@ def backward_halo_exchange(
     return inner_tensor
 
 
+_CONVOLUTION_FRONTEND_OPS = {
+    torch.ops.aten.conv1d.default: False,
+    torch.ops.aten.conv2d.default: False,
+    torch.ops.aten.conv3d.default: False,
+    torch.ops.aten.conv1d.padding: False,
+    torch.ops.aten.conv2d.padding: False,
+    torch.ops.aten.conv3d.padding: False,
+    torch.ops.aten._convolution_mode.default: False,
+    torch.ops.aten.conv_transpose1d.default: True,
+    torch.ops.aten.conv_transpose2d.input: True,
+    torch.ops.aten.conv_transpose3d.input: True,
+}
+
+
+def _distconv_convolution_frontend(func: Callable, args: tuple, kwargs: dict):
+    """Route inference convolution operators through the usual halo exchange.
+
+    Inference mode exposes these composite operators to tensor subclasses before
+    their decomposition into ``aten.convolution``. Unwrapping them generically
+    would therefore run a local convolution and omit the neighboring shards.
+    Bind their schemas because convolution and transposed convolution place
+    dilation, groups, and output padding in different argument positions.
+    """
+    bound = {
+        argument.name: (
+            args[index]
+            if index < len(args)
+            else kwargs.get(argument.name, argument.default_value)
+        )
+        for index, argument in enumerate(func._schema.arguments)
+    }
+    ndims = bound["weight"].dim() - 2
+
+    def spatial_values(value):
+        values = [value] if isinstance(value, int) else list(value)
+        return values * ndims if len(values) == 1 else values
+
+    stride = spatial_values(bound["stride"])
+    dilation = spatial_values(bound["dilation"])
+    padding = bound["padding"]
+    if isinstance(padding, str):
+        if padding == "valid":
+            padding = [0] * ndims
+        elif padding == "same":
+            if any(value != 1 for value in stride):
+                raise ValueError("DistConv: padding='same' requires stride 1")
+            total_padding = [
+                dilation[index] * (bound["weight"].size(index + 2) - 1)
+                for index in range(ndims)
+            ]
+            asymmetric_axes = [
+                index for index, value in enumerate(total_padding) if value % 2
+            ]
+            input_tensor = bound["input"]
+            if any(
+                index + 2 in input_tensor._parallel_strategy.shard_dim
+                for index in asymmetric_axes
+            ):
+                raise ValueError(
+                    "DistConv: asymmetric padding='same' on a shard dimension is not supported"
+                )
+            padding = [value // 2 for value in total_padding]
+            if asymmetric_axes:
+                # Unsharded axes need no halo and retain native same-padding
+                # support even when their left and right padding differ.
+                explicit_padding = [0] * (2 * ndims)
+                for index in asymmetric_axes:
+                    offset = 2 * (ndims - index - 1)
+                    explicit_padding[offset : offset + 2] = [
+                        total_padding[index] // 2,
+                        (total_padding[index] + 1) // 2,
+                    ]
+                    padding[index] = 0
+                padded_input = DCTensor(
+                    torch.nn.functional.pad(input_tensor._tensor, explicit_padding),
+                    input_tensor._parallel_strategy,
+                )
+                padded_input._is_periodic = input_tensor._is_periodic
+                padded_input._periodic_shard_padding = input_tensor._periodic_shard_padding
+                bound["input"] = padded_input
+        else:
+            raise ValueError(f"DistConv: unsupported padding mode {padding!r}")
+    else:
+        padding = spatial_values(padding)
+    normalized = (
+        bound["input"],
+        bound["weight"],
+        bound["bias"],
+        stride,
+        padding,
+        dilation,
+        _CONVOLUTION_FRONTEND_OPS[func],
+        spatial_values(bound.get("output_padding", 0)),
+        bound["groups"],
+    )
+    return distconv_forward(torch.ops.aten.convolution.default, normalized, {})
+
+
 def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
     """
     Perform the forward pass of the distributed convolution.
@@ -995,6 +1093,8 @@ class DCTensor(torch.Tensor):
             return distconv_forward(func, args, kwargs)
         elif func is torch.ops.aten.convolution_backward.default:
             return distconv_backward(func, args, kwargs)
+        elif func in _CONVOLUTION_FRONTEND_OPS:
+            return _distconv_convolution_frontend(func, args, kwargs)
 
         def unwrap(t):
             if isinstance(t, DCTensor):

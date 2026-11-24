@@ -1,4 +1,3 @@
-from copy import copy
 from math import prod
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -259,6 +258,16 @@ def check_is_distconv_supported(
         )
 
 
+def _halo_wire_view(tensor: torch.Tensor) -> torch.Tensor:
+    """Expose dense channels-last storage as a plain-contiguous P2P view."""
+    memory_format = infer_contiguous_format(tensor)
+    if memory_format == torch.channels_last:
+        return tensor.permute(0, 2, 3, 1)
+    if memory_format == torch.channels_last_3d:
+        return tensor.permute(0, 2, 3, 4, 1)
+    return tensor
+
+
 @torch.library.custom_op("distconv::exchange_halos", mutates_args=())
 def _exchange_halos(
     send_halo_minus: torch.Tensor,
@@ -287,14 +296,32 @@ def _exchange_halos(
     """
     halo_minus = torch.zeros_like(send_halo_minus)
     halo_plus = torch.zeros_like(send_halo_plus)
+    if num_shards == 1:
+        # Periodic faces wrap to the opposite local face. Avoid self-P2P and
+        # keep outputs independent of inputs, as the custom-op schema requires.
+        if is_periodic:
+            halo_minus.copy_(send_halo_plus)
+            halo_plus.copy_(send_halo_minus)
+        return halo_minus, halo_plus
+
+    # Gloo requires ordinary contiguous tensors, even when a tensor is dense
+    # in channels-last order. Permuting its dimensions exposes that storage
+    # without a copy and leaves the returned halo layout unchanged. Unusual
+    # strides use packed buffers and copy the received values back after wait.
+    send_minus_wire = _halo_wire_view(send_halo_minus).contiguous()
+    send_plus_wire = _halo_wire_view(send_halo_plus).contiguous()
+    recv_minus_view = _halo_wire_view(halo_minus)
+    recv_plus_view = _halo_wire_view(halo_plus)
+    recv_minus_wire = recv_minus_view.contiguous()
+    recv_plus_wire = recv_plus_view.contiguous()
     ops = []
     if shard_ind > 0:
         # Receive halo from the previous rank and send their halo back
         ops += [
-            dist.P2POp(dist.irecv, halo_minus, minus_rank),
+            dist.P2POp(dist.irecv, recv_minus_wire, minus_rank),
             dist.P2POp(
                 dist.isend,
-                send_halo_minus,
+                send_minus_wire,
                 minus_rank,
             ),
         ]
@@ -303,17 +330,17 @@ def _exchange_halos(
         ops += [
             dist.P2POp(
                 dist.isend,
-                send_halo_plus,
+                send_plus_wire,
                 plus_rank,
             ),
-            dist.P2POp(dist.irecv, halo_plus, plus_rank),
+            dist.P2POp(dist.irecv, recv_plus_wire, plus_rank),
         ]
     if shard_ind == 0 and is_periodic:
         ops += [
-            dist.P2POp(dist.irecv, halo_minus, minus_rank),
+            dist.P2POp(dist.irecv, recv_minus_wire, minus_rank),
             dist.P2POp(
                 dist.isend,
-                send_halo_minus,
+                send_minus_wire,
                 minus_rank,
             ),
         ]
@@ -324,6 +351,10 @@ def _exchange_halos(
         for req in reqs:
             req.wait()
 
+    if recv_minus_wire is not recv_minus_view:
+        recv_minus_view.copy_(recv_minus_wire)
+    if recv_plus_wire is not recv_plus_view:
+        recv_plus_view.copy_(recv_plus_wire)
     return halo_minus, halo_plus
 
 
@@ -374,9 +405,9 @@ def forward_halo_exchange(
     inner_halo_plus = tensor.narrow(shard_dim, -halo_size, halo_size)
 
     # Define communication operations
-    shard_minus = copy(parallel_strategy.shard_ind)
+    shard_minus = list(parallel_strategy.shard_ind)
     shard_minus[dim_index] -= 1
-    shard_plus = copy(parallel_strategy.shard_ind)
+    shard_plus = list(parallel_strategy.shard_ind)
     shard_plus[dim_index] += 1
     minus_rank = parallel_strategy.shard_to_rank(shard_minus)
     plus_rank = parallel_strategy.shard_to_rank(shard_plus)
@@ -431,9 +462,9 @@ def backward_halo_exchange(
     send_halo_plus = tensor.narrow(shard_dim, -halo_size, halo_size)
 
     # Define communication operations
-    shard_minus = copy(parallel_strategy.shard_ind)
+    shard_minus = list(parallel_strategy.shard_ind)
     shard_minus[dim_index] -= 1
-    shard_plus = copy(parallel_strategy.shard_ind)
+    shard_plus = list(parallel_strategy.shard_ind)
     shard_plus[dim_index] += 1
     minus_rank = parallel_strategy.shard_to_rank(shard_minus)
     plus_rank = parallel_strategy.shard_to_rank(shard_plus)
@@ -455,6 +486,20 @@ def backward_halo_exchange(
     return inner_tensor
 
 
+_CONVOLUTION_FRONTEND_OPS = {
+    torch.ops.aten.conv1d.default,
+    torch.ops.aten.conv2d.default,
+    torch.ops.aten.conv3d.default,
+    torch.ops.aten.conv1d.padding,
+    torch.ops.aten.conv2d.padding,
+    torch.ops.aten.conv3d.padding,
+    torch.ops.aten._convolution_mode.default,
+    torch.ops.aten.conv_transpose1d.default,
+    torch.ops.aten.conv_transpose2d.input,
+    torch.ops.aten.conv_transpose3d.input,
+}
+
+
 def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
     """
     Perform the forward pass of the distributed convolution.
@@ -469,6 +514,13 @@ def distconv_forward(func: Callable, args: Tuple, kwargs: Dict) -> "DCTensor":
     """
     # Convert args to a list for easier manipulation
     args = list(args)
+
+    # Native decompositions can broadcast singleton spatial arguments. Expand
+    # them before indexing shard axes, and copy lists before adjusting padding.
+    ndims = args[1].dim() - 2
+    for index in (3, 4, 5, 7):
+        values = list(args[index])
+        args[index] = values * ndims if len(values) == 1 else values
 
     # Unpack the necessary arguments
     tensor, weight, bias, stride, padding, dilation, transpose, output_padding = args[
@@ -564,6 +616,13 @@ def distconv_backward(
     """
     # Convert args to a list for easier manipulation
     args = list(args)
+
+    # Autograd saves the original spatial arguments, so backward must expand
+    # singleton lists independently of the forward normalization.
+    ndims = args[2].dim() - 2
+    for index in (4, 5, 6, 8):
+        values = list(args[index])
+        args[index] = values * ndims if len(values) == 1 else values
 
     # Unpack the necessary arguments
     (
@@ -964,6 +1023,10 @@ class DCTensor(torch.Tensor):
             return distconv_forward(func, args, kwargs)
         elif func is torch.ops.aten.convolution_backward.default:
             return distconv_backward(func, args, kwargs)
+        elif func in _CONVOLUTION_FRONTEND_OPS:
+            # Inference mode exposes composite frontends before convolution.
+            # Keep DCTensors wrapped so the decomposition still exchanges halos.
+            return func.decompose(*args, **kwargs)
 
         def unwrap(t):
             if isinstance(t, DCTensor):

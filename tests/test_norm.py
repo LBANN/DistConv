@@ -3,6 +3,7 @@ from copy import deepcopy
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from utils import cleanup_parallel_strategy, fp32_allclose
 
 from distconv import DCTensor, DistConvDDP, ParallelStrategy
@@ -312,6 +313,27 @@ def test_norm_precision(
     for buf, ref_buf in zip(norm.buffers(), ref_norm.buffers()):
         if buf.is_floating_point():
             check(buf, ref_buf, param_dtype)
+
+
+# A bias without a weight (possible through the functional API) gets its gradient in its own dtype.
+# With a float32 bias and a float16 input, the local gradient sums exceed the float16 range. A
+# reduced-precision bias still gets a gradient in its own dtype.
+@pytest.mark.parametrize("bias_dtype", [torch.float32, torch.bfloat16])
+def test_instance_norm_bias_without_weight(
+    parallel_strategy: ParallelStrategy, bias_dtype: torch.dtype, device: torch.device
+):
+    parallel_strategy.shard_dim = 2
+    x = torch.randn(2, 4, 16, device=device, dtype=torch.float16)
+    bias = torch.zeros(4, device=device, dtype=bias_dtype, requires_grad=True)
+    grad_y = torch.full_like(x, 16384)
+
+    dcy = F.instance_norm(DCTensor.distribute(x, parallel_strategy), bias=bias)
+    dcy.backward(DCTensor.distribute(grad_y, parallel_strategy))
+
+    assert bias.grad.dtype == bias_dtype
+    expected = local_shard(grad_y, parallel_strategy).float().sum((0, 2))
+    assert expected.min() > torch.finfo(torch.float16).max
+    torch.testing.assert_close(bias.grad, expected.to(bias_dtype), rtol=0, atol=0)
 
 
 # A bfloat16 input whose mean is not representable in bfloat16, with float32 running statistics

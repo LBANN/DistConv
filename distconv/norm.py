@@ -185,7 +185,8 @@ def group_norm_backward(
     if output_mask[1] and weight is not None:
         grad_weight = (dyg * xhat).sum(dim=param_dims).flatten().to(param_dtype)
     if output_mask[2]:
-        grad_bias = dyg.sum(dim=param_dims).flatten().to(param_dtype)
+        # The bias dtype is unknown here, so leave the cast to it to autograd
+        grad_bias = dyg.sum(dim=param_dims).flatten()
     return grad_in, grad_weight, grad_bias
 
 
